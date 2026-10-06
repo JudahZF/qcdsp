@@ -1,0 +1,12 @@
+/target/
+*.qcfragment/
+*.qcblock/
+.env
+.keys
+*.key
+*.raw
+*.ldr
+*.blwldr
+*.stage/
+*.backup/
+seed.hex

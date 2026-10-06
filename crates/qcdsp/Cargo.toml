@@ -1,0 +1,27 @@
+[package]
+name = "qcdsp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "A small DSP expression language and SHARC+ code generator"
+
+[dependencies]
+qc-asm.workspace = true
+qc-format.workspace = true
+qc-link.workspace = true
+qc-deploy.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+clap.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "cargo-qcdsp"
+path = "src/main.rs"

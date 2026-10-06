@@ -1,0 +1,32 @@
+[workspace]
+members = ["crates/qc-format", "crates/qc-asm", "crates/qc-link", "crates/qcdsp", "crates/qc-deploy"]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/JudahZF/qcdsp"
+publish = false
+
+[workspace.dependencies]
+qc-format = { path = "crates/qc-format" }
+qc-asm = { path = "crates/qc-asm" }
+qc-link = { path = "crates/qc-link" }
+qcdsp = { path = "crates/qcdsp" }
+qc-deploy = { path = "crates/qc-deploy" }
+aes = "0.9.3"
+ctr = "0.10.1"
+sha1 = "0.11.0"
+sha2 = "0.11.0"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+thiserror = "2"
+clap = { version = "4.6.7", features = ["derive"] }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = "warn"
