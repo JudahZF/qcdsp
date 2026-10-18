@@ -14,9 +14,9 @@ Strict parsers and byte-preserving writers for QC ModuleBlob, per-core diffs, XM
 Synthetic tests cover malformed inputs, exact round trips, bounds, metadata collisions and independently generated crypto vectors with invented secrets.
 
 ```sh
-QC_CORPUS_DIR=/path/to/decrypted/firmware cargo test -p qc-format --test corpus -- --nocapture
+QC_CORPUS_DIR=/path/to/corpus cargo test -p qc-format --test corpus -- --nocapture
 ```
 
-The opt-in corpus tests verify all `.raw` blobs under `blobs/core1`, per-core diff files under `blobs/` or the parent directory's `blobs/`, and lossless metadata clone/remove. Without the environment variable these tests print a skip message and do not validate a real corpus.
+The opt-in corpus tests verify all `.raw` blobs under `plain/blobs/core1`, per-core diff files under `plain/blobs/` or `rootfs/opt/neuraldsp/blobs/`, and lossless metadata clone/remove. Without the environment variable these tests print a skip message and do not validate a real corpus.
 
 No LDR parser is implemented yet; the current backend does not modify boot streams.

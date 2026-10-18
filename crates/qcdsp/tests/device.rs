@@ -1,5 +1,5 @@
 //! Opt-in: build every example against the user's decrypted stock Volume.
-//! `QC_CORPUS_DIR` points at `research/device/plain`; no vendor bytes are stored here.
+//! `QC_CORPUS_DIR` is the corpus root (as in Tetrad; decrypted files in `plain/`); no vendor bytes are stored here.
 
 use std::{fs, path::PathBuf};
 
@@ -13,14 +13,18 @@ use qcdsp::{
 };
 
 fn template() -> Option<VolumeTemplate> {
-    let corpus = PathBuf::from(std::env::var_os("QC_CORPUS_DIR")?);
+    let corpus = PathBuf::from(std::env::var_os("QC_CORPUS_DIR")?).join("plain");
     let core1 = fs::read(corpus.join("blobs/core1/volume.raw")).unwrap();
     let diffs = [2, 3, 4].map(|core| {
         let path = format!("blobs/core{core}/diffs.blob");
         let path = if corpus.join(&path).is_file() {
             corpus.join(&path)
         } else {
-            corpus.parent().unwrap().join(&path)
+            corpus
+                .parent()
+                .unwrap()
+                .join("rootfs/opt/neuraldsp")
+                .join(&path)
         };
         DiffFile::parse(&fs::read(path).unwrap())
             .unwrap()

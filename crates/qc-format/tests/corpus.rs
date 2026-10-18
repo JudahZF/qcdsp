@@ -1,8 +1,8 @@
 //! Opt-in round trips over the user's own decrypted stock files.
 //!
-//! Set `QC_CORPUS_DIR` to the decrypted tree (for example
-//! `research/device/plain`). It must hold `blobs/core1/*.raw`. Diff files are
-//! read from `blobs/core{2,3,4}/diffs.blob` there, or in `../blobs/` (they
+//! Set `QC_CORPUS_DIR` to the corpus root (`plain/`, `rootfs/`, `presets/`, as in Tetrad).
+//! `plain/` must hold `blobs/core1/*.raw`. Diff files are read from
+//! `plain/blobs/core{2,3,4}/diffs.blob`, or from `rootfs/opt/neuraldsp/blobs/` (they
 //! are not encrypted, so they usually sit next to the decrypted tree).
 //! Without the variable the tests skip.
 
@@ -13,10 +13,10 @@ use qc_format::diff::{DiffFile, DiffRecord};
 use qc_format::metadata;
 
 fn corpus() -> Option<PathBuf> {
-    let dir = PathBuf::from(std::env::var_os("QC_CORPUS_DIR")?);
+    let dir = PathBuf::from(std::env::var_os("QC_CORPUS_DIR")?).join("plain");
     assert!(
         dir.join("blobs/core1").is_dir(),
-        "QC_CORPUS_DIR has no blobs/core1"
+        "QC_CORPUS_DIR has no plain/blobs/core1"
     );
     Some(dir)
 }
@@ -32,7 +32,9 @@ fn diffs_path(dir: &Path, core: u32) -> PathBuf {
     if local.exists() {
         local
     } else {
-        dir.join(format!("../blobs/core{core}/diffs.blob"))
+        dir.parent()
+            .unwrap()
+            .join(format!("rootfs/opt/neuraldsp/blobs/core{core}/diffs.blob"))
     }
 }
 

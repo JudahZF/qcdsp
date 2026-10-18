@@ -88,13 +88,13 @@ cargo install --path crates/qcdsp --locked
 Some tests need files that this repository does not include. These tests skip or are ignored when their variable is not set:
 
 ```sh
-QC_CORPUS_DIR=path/to/decrypted/firmware \
+QC_CORPUS_DIR=path/to/corpus \
 QC_BLOBDIS=path/to/blobdis \
 SELACHE=path/to/selache/bin \
   cargo test --workspace -- --include-ignored
 ```
 
-- `QC_CORPUS_DIR` is a decrypted copy of your own firmware tree (`blobs/core1/*.raw`, diff files and XML).
+- `QC_CORPUS_DIR` is the corpus root, the same folder Tetrad uses: `plain/` is a decrypted copy of your own firmware tree (`blobs/core1/*.raw`, diff files and XML), `rootfs/` a copy of the root file system (diff files fall back to `rootfs/opt/neuraldsp/blobs/`), and `presets/`.
 - `QC_BLOBDIS` is a blob decoder based on selache.
 - `SELACHE` is the directory that holds selache's `selas` and `seldump`.
 

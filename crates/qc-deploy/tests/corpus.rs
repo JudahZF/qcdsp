@@ -19,7 +19,9 @@ impl Drop for Scratch {
 
 #[test]
 fn stock_volume_payload_stages_applies_and_restores_on_a_private_copy() {
-    let Some(corpus) = std::env::var_os("QC_CORPUS_DIR").map(PathBuf::from) else {
+    let Some(corpus) =
+        std::env::var_os("QC_CORPUS_DIR").map(|dir| PathBuf::from(dir).join("plain"))
+    else {
         eprintln!("skipped stock-payload clone: set QC_CORPUS_DIR");
         return;
     };
@@ -59,7 +61,11 @@ fn stock_volume_payload_stages_applies_and_restores_on_a_private_copy() {
         let source = if corpus.join(&path).is_file() {
             corpus.join(&path)
         } else {
-            corpus.parent().unwrap().join(&path)
+            corpus
+                .parent()
+                .unwrap()
+                .join("rootfs/opt/neuraldsp")
+                .join(&path)
         };
         let bytes = fs::read(source).unwrap();
         fs::write(root.join(&path), &bytes).unwrap();

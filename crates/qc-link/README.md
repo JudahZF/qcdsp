@@ -16,7 +16,7 @@ Section 2 uses little-endian sixteen-bit parcels. Section 3 uses little-endian s
 
 ```sh
 cargo test -p qc-link
-QC_CORPUS_DIR=/path/to/decrypted/firmware cargo test -p qc-link --test corpus -- --nocapture
+QC_CORPUS_DIR=/path/to/corpus cargo test -p qc-link --test corpus -- --nocapture
 ```
 
 Corpus tests re-link the subset of stock blobs with supported relocation kinds and reproduce known absolute kernel patches for all other cores. Unsupported relocation kinds fail closed; a pass does not imply all stock blobs can be newly linked.

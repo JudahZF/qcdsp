@@ -214,7 +214,7 @@ local and remote backups, and bounded upload chunks. They never invoke SSH/SCP.
 The opt-in corpus test exercises a real stock volume payload, both full stock XML documents, and all three stock diff files on a new private temporary copy:
 
 ```sh
-QC_CORPUS_DIR=/path/to/decrypted/firmware cargo test -p qc-deploy --test corpus -- --nocapture
+QC_CORPUS_DIR=/path/to/corpus cargo test -p qc-deploy --test corpus -- --nocapture
 ```
 
 It re-encrypts the stock plaintext with invented secrets and uses synthetic firmware identity files. Staging, validation, local apply and restore must preserve the original files byte-for-byte. This tests real payload structure, not compatibility with an actual pinned firmware tree or audio behavior.

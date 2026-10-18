@@ -1,8 +1,8 @@
 //! Opt-in checks against the user's own decrypted stock files.
 //!
-//! `QC_CORPUS_DIR` is the decrypted tree (for example `research/device/plain`)
-//! with `blobs/core1/*.raw` and `kernel_call_map.json`. Diff files are read
-//! from `blobs/core{2,3,4}/diffs.blob` there, or in `../blobs/`.
+//! `QC_CORPUS_DIR` is the corpus root (as in Tetrad); `plain/` holds
+//! `blobs/core1/*.raw` and `kernel_call_map.json`. Diff files are read from
+//! `plain/blobs/core{2,3,4}/diffs.blob`, or from `rootfs/opt/neuraldsp/blobs/`.
 //! Without the variable the tests skip.
 
 use std::collections::BTreeMap;
@@ -13,10 +13,10 @@ use qc_format::diff::DiffFile;
 use qc_link::{KernelForm, KernelMap, KernelRef, LinkError, LinkInput, link};
 
 fn corpus() -> Option<PathBuf> {
-    let dir = PathBuf::from(std::env::var_os("QC_CORPUS_DIR")?);
+    let dir = PathBuf::from(std::env::var_os("QC_CORPUS_DIR")?).join("plain");
     assert!(
         dir.join("blobs/core1").is_dir(),
-        "QC_CORPUS_DIR has no blobs/core1"
+        "QC_CORPUS_DIR has no plain/blobs/core1"
     );
     Some(dir)
 }
@@ -124,7 +124,9 @@ fn kernel_map_reproduces_stock_absolute_patches() {
             let path = if local.exists() {
                 local
             } else {
-                dir.join(format!("../blobs/core{core}/diffs.blob"))
+                dir.parent()
+                    .unwrap()
+                    .join(format!("rootfs/opt/neuraldsp/blobs/core{core}/diffs.blob"))
             };
             DiffFile::parse(&std::fs::read(path).unwrap()).unwrap()
         })

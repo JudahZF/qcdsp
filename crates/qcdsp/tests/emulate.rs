@@ -294,7 +294,7 @@ fn disassemble(bytes: &[u8], name: &str) -> HashMap<u32, Line> {
 }
 
 fn template() -> Option<VolumeTemplate> {
-    let corpus = PathBuf::from(std::env::var_os("QC_CORPUS_DIR")?);
+    let corpus = PathBuf::from(std::env::var_os("QC_CORPUS_DIR")?).join("plain");
     std::env::var_os("QC_BLOBDIS")?;
     let core1 = fs::read(corpus.join("blobs/core1/volume.raw")).unwrap();
     let diffs = [2, 3, 4].map(|core| {
@@ -302,7 +302,11 @@ fn template() -> Option<VolumeTemplate> {
         let path = if corpus.join(&path).is_file() {
             corpus.join(&path)
         } else {
-            corpus.parent().unwrap().join(&path)
+            corpus
+                .parent()
+                .unwrap()
+                .join("rootfs/opt/neuraldsp")
+                .join(&path)
         };
         DiffFile::parse(&fs::read(path).unwrap())
             .unwrap()
