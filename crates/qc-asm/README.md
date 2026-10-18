@@ -173,3 +173,6 @@ CARGO_TARGET_DIR=/tmp/qc-asm-visa-target cargo clippy -p qc-asm --locked --offli
 No text assembly parser, symbolic external relocation, calls, hardware-loop builder, SIMD setup, arbitrary parallel compute/memory forms, PM accesses in the leaf API, automatic register allocation, hazard scheduling, or arbitrary raw-parcel insertion is provided. Only local Type 8a label jumps are resolved. Cross-index MODIFY is not exposed; `ModifyIndex` changes its own index. Post-modify DM is limited to R0–R15; pre-modify and immediate-offset DM support universal registers.
 
 Arithmetic precision, rounding, exceptions, denormals, NaNs, saturation, status, and implicit PEy operations depend on processor configuration. Hardware `MIN`/`MAX` need not share the exceptional-value behavior of host `f32::min`/`max`. Conditional branches in SIMD mode depend on the combined PE conditions. This is static encoding and external decode verification, **not hardware execution testing, timing proof, callback ABI validation, or a claim that arbitrary fragments are safe to deploy**.
+
+The parameter guard also exposes Type 2a `COMPU` and the Type 8a GT condition
+(code 18, after COMPU). The numeric vectors and external decoder check both forms.

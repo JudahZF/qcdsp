@@ -1,4 +1,8 @@
-use qcdsp::{Block, BlockBuilder, Category, Error, Parameter, Processor, codegen, examples};
+use qcdsp::{
+    Block, BlockBuilder, Category, Error, Parameter, Processor,
+    codegen::{self, InputSource, Step},
+    examples,
+};
 
 fn assert_close(actual: f32, expected: f32) {
     assert!(
@@ -82,6 +86,10 @@ fn lowering_matches_graph_execution_for_all_examples() {
         examples::soft_clip().unwrap(),
         examples::delay(17).unwrap(),
         examples::biquad([0.06745527, 0.13491054, 0.06745527, -1.1429805, 0.4128016]).unwrap(),
+        examples::tremolo().unwrap(),
+        examples::envelope_filter().unwrap(),
+        examples::micro_synth(examples::Voicing::Guitar).unwrap(),
+        examples::micro_synth(examples::Voicing::Bass).unwrap(),
     ];
     for block in blocks {
         let decoded = Block::from_json(&block.to_json().unwrap()).unwrap();
@@ -116,7 +124,7 @@ fn lowering_matches_graph_execution_for_all_examples() {
 }
 
 #[test]
-fn allocator_reuses_temporaries_but_rejects_excess_input_pressure() {
+fn allocator_reuses_temporaries_and_handles_wide_blocks() {
     let mut dsp = BlockBuilder::new("chain", "Chain", Category::Utility);
     let one = dsp.constant(1.0).unwrap();
     let mut output = dsp.input();
@@ -130,18 +138,225 @@ fn allocator_reuses_temporaries_but_rejects_excess_input_pressure() {
         101.0
     );
 
-    let mut dsp = BlockBuilder::new("pressure", "Pressure", Category::Utility);
+    // More inputs than registers: loaded at first use instead of all up front.
+    let mut dsp = BlockBuilder::new("wide", "Wide", Category::Utility);
     let mut output = dsp.input();
-    for index in 0..16 {
+    for index in 0..24 {
         let parameter = dsp
             .parameter(Parameter::new(format!("p{index}"), 0.0, 1.0, 0.5).unwrap())
             .unwrap();
+        let state = dsp.state(index as f32).unwrap();
         output = dsp.add(output, parameter).unwrap();
+        output = dsp.add(output, state.signal()).unwrap();
+        dsp.update_state(state, output).unwrap();
     }
+    let block = dsp.finish(output).unwrap();
+    let mut reference = Processor::new(block.clone()).unwrap();
+    let mut lowered = Processor::compiled(block).unwrap();
+    for sample in 0..8 {
+        let input = sample as f32 * 0.25;
+        assert_eq!(
+            lowered.process_sample(input),
+            reference.process_sample(input)
+        );
+    }
+
+    // An op whose operands both stay live needs three registers.
+    let mut dsp = BlockBuilder::new("three", "Three", Category::Utility);
+    let x = dsp.input();
+    let y = dsp.state(1.0).unwrap();
+    let product = dsp.mul(x, y.signal()).unwrap();
+    let sum = dsp.add(product, x).unwrap();
+    let output = dsp.add(sum, y.signal()).unwrap();
+    let block = dsp.finish(output).unwrap();
     assert!(matches!(
-        codegen::compile(&dsp.finish(output).unwrap()),
+        codegen::compile_with(&block, 0b11),
         Err(Error::RegisterPressure)
     ));
+    assert!(codegen::compile_with(&block, 0b111).is_ok());
+}
+
+#[test]
+fn parameter_math_is_hoisted_out_of_the_sample_loop() {
+    let mut dsp = BlockBuilder::new("taper", "Taper", Category::Utility);
+    let input = dsp.input();
+    let level = dsp
+        .parameter(Parameter::new("Level", 0.0, 1.0, 0.5).unwrap())
+        .unwrap();
+    let one = dsp.constant(1.0).unwrap();
+    let squared = dsp.mul(level, level).unwrap();
+    let gain = dsp.add(squared, one).unwrap();
+    let output = dsp.mul(input, gain).unwrap();
+    let block = dsp.finish(output).unwrap();
+    let contract = codegen::compile(&block).unwrap().contract;
+    assert_eq!(contract.control_slots, 1);
+    let computes = |steps: &[Step]| {
+        steps
+            .iter()
+            .filter(|step| matches!(step, Step::Compute { .. }))
+            .count()
+    };
+    // Control: load 1.0, square, add. Sample: only the multiply.
+    assert_eq!(computes(&contract.control), 3);
+    assert_eq!(computes(&contract.sample), 1);
+    let mut processor = Processor::compiled(block).unwrap();
+    processor.set_parameter(0, 0.5).unwrap();
+    assert_eq!(processor.process_sample(2.0), 2.5);
+}
+
+/// Deterministic LCG, so failures name a reproducible seed.
+struct Random(u64);
+
+impl Random {
+    fn next(&mut self) -> u32 {
+        self.0 = self
+            .0
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (self.0 >> 33) as u32
+    }
+    fn below(&mut self, limit: usize) -> usize {
+        self.next() as usize % limit
+    }
+    fn unit(&mut self) -> f32 {
+        self.next() as f32 / (1u64 << 31) as f32 * 2.0 - 1.0
+    }
+}
+
+/// A random graph with many inputs, long live ranges, state chains and swaps,
+/// and delay taps. Products are clamped so values stay finite.
+fn random_block(seed: u64) -> Block {
+    let mut random = Random(seed);
+    let mut dsp = BlockBuilder::new("fuzz", "Fuzz", Category::Utility);
+    let mut signals = vec![dsp.input()];
+    for index in 0..random.below(20) {
+        let default = random.unit();
+        let parameter = Parameter::new(format!("p{index}"), -1.0, 1.0, default).unwrap();
+        signals.push(dsp.parameter(parameter).unwrap());
+    }
+    let states: Vec<_> = (0..random.below(16))
+        .map(|_| dsp.state(random.unit()).unwrap())
+        .collect();
+    let delays: Vec<_> = (0..random.below(3))
+        .map(|_| dsp.delay(1 + random.below(5)).unwrap())
+        .collect();
+    signals.extend(states.iter().map(|state| state.signal()));
+    signals.extend(delays.iter().map(|delay| delay.signal()));
+    let low = dsp.constant(-4.0).unwrap();
+    let high = dsp.constant(4.0).unwrap();
+    for _ in 0..3 {
+        signals.push(dsp.constant(random.unit()).unwrap());
+    }
+    for _ in 0..20 + random.below(100) {
+        // Mostly recent operands (chains), sometimes old ones (long live ranges).
+        let pick = |random: &mut Random| {
+            if random.below(3) == 0 {
+                signals[random.below(signals.len())]
+            } else {
+                signals[signals.len() - 1 - random.below(signals.len().min(6))]
+            }
+        };
+        let (a, b) = (pick(&mut random), pick(&mut random));
+        let value = match random.below(7) {
+            0 => dsp.add(a, b).unwrap(),
+            1 => dsp.sub(a, b).unwrap(),
+            2 => {
+                let product = dsp.mul(a, b).unwrap();
+                let bounded = dsp.max(product, low).unwrap();
+                dsp.min(bounded, high).unwrap()
+            }
+            3 => dsp.min(a, b).unwrap(),
+            4 => dsp.max(a, b).unwrap(),
+            5 => dsp.neg(a).unwrap(),
+            _ => dsp.abs(a).unwrap(),
+        };
+        signals.push(value);
+    }
+    for state in states {
+        if random.below(5) != 0 {
+            dsp.update_state(state, signals[random.below(signals.len())])
+                .unwrap();
+        }
+    }
+    for delay in delays {
+        if random.below(5) != 0 {
+            dsp.update_delay(delay, signals[random.below(signals.len())])
+                .unwrap();
+        }
+    }
+    let output = signals[signals.len() - 1 - random.below(signals.len().min(4))];
+    dsp.finish(output).unwrap()
+}
+
+#[test]
+fn random_graphs_lower_exactly_under_any_register_budget() {
+    // All registers; six scattered ones; the three-register minimum.
+    let budgets = [u16::MAX, 0b0110_0001_1000_0101, 0b111];
+    for seed in 0..300 {
+        let block = random_block(seed);
+        for budget in budgets {
+            let kernel = codegen::compile_with(&block, budget).unwrap();
+            assert!(kernel.contract.registers_used <= budget.count_ones() as usize);
+            let mut reference = Processor::new(block.clone()).unwrap();
+            let mut lowered = Processor::lowered(block.clone(), kernel).unwrap();
+            let mut random = Random(seed ^ 0x5eed);
+            for sample in 0..64 {
+                if sample == 20 {
+                    for index in 0..block.parameters().len() {
+                        let value = random.unit();
+                        reference.set_parameter(index, value).unwrap();
+                        lowered.set_parameter(index, value).unwrap();
+                    }
+                }
+                if sample == 40 {
+                    reference.reset();
+                    lowered.reset();
+                }
+                let input = random.unit();
+                let (expected, actual) = (
+                    reference.process_sample(input),
+                    lowered.process_sample(input),
+                );
+                // Same operations in the same order: results must be bit-identical.
+                assert!(
+                    actual.to_bits() == expected.to_bits()
+                        || (actual.is_nan() && expected.is_nan()),
+                    "seed {seed}, budget {budget:#06x}, sample {sample}: {actual} != {expected}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn duplicate_source_nodes_from_imported_ir_share_one_value() {
+    // The builder makes one node per state; hand-written IR can repeat them.
+    // State 0 is written early, but three copies of its old value feed later
+    // writes of states 1-3. As separate values they would need four registers.
+    let block = Block::from_json(
+        r#"{"version":1,"blob_name":"dup","name":"Dup","category":"utility",
+        "parameters":[],"delays":[],
+        "states":[{"initial":0.5,"update":5},{"initial":0.0,"update":2},
+            {"initial":0.0,"update":3},{"initial":0.0,"update":4}],
+        "nodes":[{"op":"input"},{"op":"state","index":0},{"op":"state","index":0},
+            {"op":"state","index":0},{"op":"state","index":0},
+            {"op":"binary","kind":"mul","lhs":0,"rhs":1},
+            {"op":"state","index":1},{"op":"state","index":2},{"op":"state","index":3},
+            {"op":"binary","kind":"add","lhs":6,"rhs":7},{"op":"binary","kind":"add","lhs":9,"rhs":8},
+            {"op":"binary","kind":"add","lhs":10,"rhs":5}],
+        "output":11}"#,
+    )
+    .unwrap();
+    let kernel = codegen::compile_with(&block, 0b111).unwrap();
+    let mut reference = Processor::new(block.clone()).unwrap();
+    let mut lowered = Processor::lowered(block, kernel).unwrap();
+    for sample in 0..8 {
+        let input = 1.0 + sample as f32;
+        assert_eq!(
+            lowered.process_sample(input),
+            reference.process_sample(input)
+        );
+    }
 }
 
 #[test]
@@ -154,7 +369,17 @@ fn dead_expressions_do_not_consume_registers() {
     let input = dsp.input();
     let block = dsp.finish(input).unwrap();
     let kernel = codegen::compile(&block).unwrap();
-    assert_eq!(kernel.contract.inputs.len(), 1);
+    assert!(kernel.contract.control.is_empty());
+    assert!(matches!(
+        kernel.contract.sample[..],
+        [
+            Step::Load {
+                source: InputSource::Audio,
+                ..
+            },
+            Step::StoreOutput { .. }
+        ]
+    ));
     assert!(kernel.encode().unwrap().is_empty());
     assert_eq!(
         Processor::compiled(block).unwrap().process_sample(-0.125),

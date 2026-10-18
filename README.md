@@ -1,24 +1,40 @@
 # qcdsp
 
-A Rust backend for a small DSP language that builds installable Quad Cortex blocks, following `plans/2026-10-05-qcdsp-custom-blocks.html`.
+qcdsp is a Rust toolchain that makes custom DSP blocks for the Quad Cortex. You write a block with a small Rust expression language. You test the block on your computer. Then qcdsp compiles the block to SHARC+ machine code, stages it for your own unit and installs it over SSH.
 
-Write a block with the Rust expression builder, test it on the host, then compile it into an encrypted stage for your own device and install it over SSH. Generated blocks run on the SHARC+ cores as three VISA callbacks appended to the stock Volume framework from your firmware (see `docs/abi-status.md`).
+qcdsp is part of [Tetrad](https://github.com/JudahZF/tetrad), an independent Rust user interface for the Quad Cortex. Tetrad includes this repository as a git submodule at `qcdsp/`.
 
-**Status (2026-10-06):** the full pipeline builds, stages and installs. The generated code is verified by emulating the independent decoder's reading of it. `Gain (qcdsp)` (model id 16901) is installed on the device and loads in a preset; its audio output is not yet tested. The other examples have not been installed.
+> **Warning.** This is an unofficial research tool. An install rewrites firmware data files on your Quad Cortex. A bad block can stop audio, crash the DSP cores or make a restore from backup necessary. Make a full SD-card backup before you install a block. You use this tool at your own risk. qcdsp supports only CorOS 4.1.0 and refuses other builds.
 
-## Workspace
+## Crates
 
-| Crate | Responsibility |
+| Crate | Purpose |
 | --- | --- |
-| `qc-format` | ModuleBlob, per-core diffs, NDSP crypto, byte-preserving metadata edits |
-| `qc-asm` | Verified SHARC+ ISA48 and VISA encoder subset, labels and PC-relative jumps |
-| `qc-link` | Generic linker: sections, relocations, mapped kernel references, per-core diffs |
-| `qcdsp` | DSL, IR, host reference, register allocation, device callbacks, CLI |
-| `qc-deploy` | Firmware-pinned staging, local apply/restore, guarded SSH install/uninstall |
+| `qc-format` | Reads and writes Quad Cortex block files: ModuleBlob, per-core diff records, NDSP encryption and byte-preserving `ModelRepo.xml` edits |
+| `qc-asm` | Encodes a verified subset of SHARC+ ISA48 and VISA instructions, with labels and PC-relative jumps |
+| `qc-link` | Links code and data sections, relocations and kernel references into a ModuleBlob and its per-core diffs |
+| `qcdsp` | The DSP language, IR, host reference processor, register allocator, device code generator and the `cargo-qcdsp` CLI |
+| `qc-deploy` | Stages a block against a firmware pin, applies and restores it locally, and installs or uninstalls it over SSH with guards |
 
-No vendor keys, key locations, firmware, stock blobs or kernel maps are included; everything device-specific is read from your own copy. `selache` is not linked; tests run it only as an external oracle.
+Each crate except `qcdsp` has its own README. `docs/abi-status.md` describes the block ABI that generated code uses.
 
-> **Warning.** This is an unofficial research tool, not affiliated with or endorsed by Neural DSP. Installing a block rewrites firmware data files on your Quad Cortex. A faulty block can stop audio, crash the DSP cores or need a restore from backup. Make a full SD-card backup first and use it at your own risk. Only CorOS 4.1.0 is supported; other builds are refused.
+## How Tetrad uses qcdsp
+
+Tetrad uses these crates as path dependencies:
+
+- **`qc-format`**: Tetrad's catalogue, block, DSP-host, media, CLI and app crates read and write ModuleBlobs, diff files and model metadata, and decrypt NDSP files.
+- **`qc-asm`**: Tetrad's `tetrad-blocks` and `tetrad-sharc` tests encode VISA instructions. These encodings are an independent check of Tetrad's own SHARC+ decoder.
+
+qcdsp does not depend on Tetrad. Tetrad's `tetrad-sharc` tests use the `qcdsp` crate and run the generated code of all eight examples on Tetrad's raw SHARC+ machine. That machine does not share code with `qc-asm`, so these tests do not check the encoder against itself.
+
+## Status
+
+- All eight example blocks compile to installable stages. They run correctly on Tetrad's `tetrad-sharc` machine with PRM arithmetic.
+- The `Gain` example (model id 16901) loaded in a preset on a unit. It was then uninstalled to restore stock Cortex Control compatibility. Its audio output is not tested.
+- The other examples have not been installed on a unit.
+- CPU figures are estimates, not measurements.
+
+`docs/abi-status.md` lists the open items.
 
 ## Write a block
 
@@ -41,39 +57,76 @@ fn main() -> qcdsp::Result<()> {
 }
 ```
 
-Operations: input, parameter, constant, state, delay tap, add, subtract, multiply, negate, min, max. `examples` has gain, a biquad, a feedback delay and a soft clipper.
+Operations: input, parameter, constant, state, delay tap, add, subtract, multiply, negate, absolute value, min and max.
 
-- `state(initial)` is one persistent sample value; `delay(samples)` is a zero-filled delay line. Each has at most one update. Reads see the previous sample; updates commit after the output.
-- Parameters are in DSP units. On the device they appear as 0..1 controls and are mapped to `[min, max]`.
-- On the device each block processes 32-sample blocks of two channels with independent state. Total state must fit 32 KB (delay lines of roughly 4000 samples per channel).
-- More than 14 simultaneously live values (15 without delays) is a compile error; there is no spilling.
+`qcdsp::examples` has these blocks: gain, biquad, feedback delay, soft clipper, sine tremolo, envelope filter, and models of the Electro-Harmonix Micro Synthesizer and Bass Micro Synthesizer (`examples::micro_synth`). `crates/qcdsp/src/examples/kit.rs` has the shared parts: one-pole filters, an envelope follower, a state-variable filter and a `2^x` approximation for exponential tapers.
 
-## Build, test and install
+Rules:
+
+- `state(initial)` is one persistent sample value. `delay(samples)` is a delay line that starts at zero. Each one has a maximum of one update. A read gives the value from the previous sample. An update takes effect at the next sample.
+- Parameters use DSP units. On the unit, each parameter shows as a 0..1 control. qcdsp maps it to `[min, max]`.
+- On the unit, a block processes 32-sample blocks of two channels. Each channel has its own state and its own `io` descriptor pointer. The two buffers do not have to be adjacent. The total state must be 32 KB or less. This gives delay lines of approximately 4000 samples per channel.
+- An expression of only parameters and constants (for example a taper or a filter coefficient) is calculated once per 32-sample call, not once per sample.
+- The compiler loads values when they are first used. It writes each state when its new value is available. When the 14 data registers (15 without delays) are all in use, the compiler reloads or spills values to a per-channel slot in the block state. Spills and hoisted values count toward the 32 KB.
+
+## Build and test
+
+You need Rust 1.95 or later.
 
 ```sh
+git clone https://github.com/JudahZF/qcdsp
+cd qcdsp
+cargo build --workspace
 cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+cargo fmt --check
 cargo install --path crates/qcdsp --locked
 ```
 
-### What a device build needs
+### Optional tests with your own firmware
 
-All inputs come from your own Quad Cortex:
+Some tests need files that this repository does not include. These tests skip or are ignored when their variable is not set:
 
-| Input | Flag | How to get it |
+```sh
+QC_CORPUS_DIR=path/to/decrypted/firmware \
+QC_BLOBDIS=path/to/blobdis \
+SELACHE=path/to/selache/bin \
+  cargo test --workspace -- --include-ignored
+```
+
+- `QC_CORPUS_DIR` is a decrypted copy of your own firmware tree (`blobs/core1/*.raw`, diff files and XML).
+- `QC_BLOBDIS` is a blob decoder based on selache.
+- `SELACHE` is the directory that holds selache's `selas` and `seldump`.
+
+selache is GPL-3.0. qcdsp does not include or link it. The tests run it only as an external program.
+
+With these files, the tests do a round trip of all 371 stock blobs and diff files, link the stock blobs again, reproduce 40,889 kernel patch sites, stage, apply and restore a real stock payload on a private copy, link each example against the real Volume template, and run each generated block against the host reference.
+
+Without these files, `tests/dsp.rs` checks the register allocator on 300 random graphs at three register budgets against the graph interpreter. The host graph is a mathematical reference with a tolerance. It is not a bit-exact SHARC model.
+
+## Install a block on your unit
+
+### Inputs from your own unit
+
+This repository does not include vendor keys, key locations, firmware, stock blobs or kernel maps. All device inputs come from your own Quad Cortex:
+
+| Input | Flag | Source |
 | --- | --- | --- |
-| Firmware copy | `--snapshot` | A local copy of `/opt/neuraldsp` (never the live path) |
+| Firmware copy | `--snapshot` | A local copy of `/opt/neuraldsp`. Do not use the live path. |
 | Serial | `--serial-file` | A copy of `/etc/qc_sn` |
-| Firmware pin | `--pin` | JSON with the SHA-256 of `ZenUI` and the five `sharc_binaries` runtime files, made from a copy you trust (see below) |
-| Key file | `--keys` | Private (0600) file of hex lines, any order: the repo key and the blob key (16 bytes each) and the report seed |
+| Firmware pin | `--pin` | JSON with the SHA-256 of `ZenUI` and of the five `sharc_binaries` runtime files, made from a copy that you trust |
+| Key file | `--keys` | A private (mode 0600) file of hex lines in any order: the repo key, the blob key (16 bytes each) and the report seed |
 
-The **report seed** is found in your own ZenUI copy:
+To find the **report seed** in your own ZenUI copy:
 
 ```sh
 cargo qcdsp find-seed --snapshot path/to/neuraldsp --serial-file path/to/qc_sn --output seed.hex
-cat seed.hex >> path/to/keys    # both files are mode 0600
+cat seed.hex >> path/to/keys    # keep both files at mode 0600
 ```
 
-`find-seed` tests NUL-delimited byte runs of ZenUI, then every 57-byte window, against `moduleReport.xml`; it does not depend on a fixed offset. The **repo and blob keys** exist only in ZenUI's memory while it runs; qcdsp does not extract them. Recover them with a short-lived on-device memory scan (ZenUI kills unknown processes within seconds). qcdsp checks every secret by decrypting a known file and never prints one.
+`find-seed` tests the NUL-delimited byte runs of ZenUI, then every 57-byte window, against `moduleReport.xml`. It does not use a fixed offset.
+
+The **repo key** and **blob key** are only in ZenUI's memory while it runs. qcdsp does not extract them. You must recover them yourself, for example with a short on-device memory scan. qcdsp checks each secret by decrypting a known file. It never prints a secret.
 
 The pin format:
 
@@ -84,58 +137,50 @@ The pin format:
     "SOC2_SPL_Core0_Atma.blwldr": "<hex>" } }
 ```
 
-### Build and install
+### Build, install and uninstall
 
 ```sh
 DEV="--snapshot path/to/neuraldsp --pin pin.json --keys path/to/keys --serial-file path/to/qc_sn"
 
-# Compile and stage (writes only the new stage directory)
+# Compile and stage. This writes only the new stage directory.
 cargo qcdsp build --block my_gain.qcdsp.json $DEV --model-id 16901 --output target/my_gain.stage
 
-# Print the exact install plan; nothing is sent
+# Show the install plan. This sends nothing.
 cargo qcdsp install --stage target/my_gain.stage --pin pin.json \
   --serial-file path/to/qc_sn --backup target/my_gain.backup --token my-gain-1
 
-# Install for real, then reboot the QC
+# Install, then reboot the unit.
 cargo qcdsp install ... --confirm-device-write
 
-# Restore the saved originals, then reboot
+# Restore the saved original files, then reboot the unit.
 cargo qcdsp uninstall --pin ... --serial-file ... --backup target/my_gain.backup --token my-gain-1 --confirm-device-write
 ```
 
-`--model-id` must be unused in your `ModelRepo.xml`; staging refuses a collision. Install and uninstall connect with `ssh <host>` (`--host`, default `qc`) using your SSH config. The QC's OpenSSH 6.7 can need a byte-at-a-time banner proxy: set it in your SSH config or pass `--proxy-command 'python3 proxy.py %h %p'`.
+- `--model-id` must not be in use in your `ModelRepo.xml`. Staging refuses a collision.
+- Install and uninstall connect with `ssh <host>` (`--host`, default `qc`) and use your SSH config. The unit's OpenSSH 6.7 can need a proxy that sends the banner one byte at a time. Set it in your SSH config or use `--proxy-command '<command> %h %p'`.
+- On the tested firmware, a changed `ModelRepo.xml` stops stock Cortex Control from connecting. The stock catalogue restores the connection.
+- Generated blob names start with `qcdsp_`.
+- Install backs up the original files locally and on the unit. It publishes each file with an atomic rename, but the six-file install as a whole is not transactional. It never reboots the unit.
+- Uninstall refuses files that changed after the install.
+- `stage-clone` stages an unchanged clone of the stock Volume block. Use it to test the install path without generated code.
 
-Generated blob names are prefixed `qcdsp_`. Install backs up originals locally and on the device, publishes each file by atomic rename (the six-file install is not transactional), and never reboots; uninstall refuses files that changed since install. `stage-clone` stages an unchanged stock Volume clone (the postplan's M1 install test).
+Other commands: `render` (runs the host reference or the lowered interpreter on a JSON sample array or a WAV file), `export-ir`, `fragment` (shows the raw ISA48 kernel and its step list) and `inspect` (shows the decrypted ModuleBlob structure).
 
-Other commands: `render` (host reference or lowered interpreter on a JSON sample array), `export-ir`, `fragment` (raw ISA48 kernel for inspection), `inspect` (decrypted ModuleBlob structure).
-
-## Verification
+Listen to a block before you install it:
 
 ```sh
-cargo clippy --workspace --all-targets -- -D warnings
-QC_CORPUS_DIR=path/to/decrypted/neuraldsp \
-QC_BLOBDIS=path/to/blobdis \
-SELACHE=path/to/selache/bin \
-  cargo test --workspace -- --include-ignored
+cargo qcdsp render --example micro-synth --input di.wav --output synth.wav --compiled \
+  --param "start freq=0.05" --param "stop freq=0.9" --param resonance=0.8
 ```
 
-The opt-in variables are optional. `QC_CORPUS_DIR` is a decrypted copy of your firmware tree (`blobs/core1/*.raw`, diff files, XML). `QC_BLOBDIS` is a selache-based blob decoder and `SELACHE` holds selache's `selas`/`seldump`; neither is included because selache is GPL-3.0.
+`--param` takes a parameter index or name. `--compiled` runs the lowered steps instead of the graph.
 
-The opt-in tests round-trip all 371 stock blobs and diff files, re-link stock blobs, reproduce 40,889 kernel patch sites, stage/apply/restore a real stock payload on a private copy, link every example against the real Volume template, and emulate each generated block against the host reference.
+## Licence
 
-## Postplan milestones
-
-| Milestone | Status |
-| --- | --- |
-| M1 clone test | Implemented and tested locally; skipped on device (Gain installed directly) |
-| M2 ABI map | Done (summary in `docs/abi-status.md`; full notes are private) |
-| M3 open gain block | Installed on the device and loads in a preset; audio test pending |
-| M4 DSL v1 | Gain, biquad, delay, drive compile to installable stages; only Gain installed; CPU not measured |
-| M5 emulator | Decoder-driven emulator for generated code (not a full SHARC model) |
-| M6 polish | Not started (VISA compression, SIMD, hardware loops) |
-
-## License
-
-Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or [MIT license](LICENSE-MIT) at your option.
+qcdsp is licensed under either of the [Apache License, Version 2.0](LICENSE-APACHE) or the [MIT license](LICENSE-MIT), at your option.
 
 Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in this work, as defined in the Apache-2.0 license, shall be dual licensed as above, without any additional terms or conditions.
+
+## Trademarks
+
+qcdsp is an independent project. It is not affiliated with, endorsed by or supported by Neural DSP Technologies. Quad Cortex, Neural DSP and CorOS are trademarks of their owners.

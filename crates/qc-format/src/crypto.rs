@@ -13,10 +13,12 @@
 
 use aes::cipher::{KeyIvInit, StreamCipher};
 use sha1::{Digest, Sha1};
+use zeroize::Zeroize;
 
 type Aes128Ctr = ctr::Ctr128BE<aes::Aes128>;
 
-/// AES key and initial counter derived from one NDSP secret.
+/// AES key and initial counter derived from one NDSP secret. Both are zeroed on drop, so
+/// share one value (for example behind an `Arc`) rather than cloning it.
 #[derive(Clone)]
 pub struct NdspCipher {
     key: [u8; 16],
@@ -35,14 +37,18 @@ impl NdspCipher {
             }
             digest
         };
-        let d1 = sha1_10(&[]);
-        let d2 = sha1_10(&d1);
-        let mut key = [0; 16];
-        let mut counter = [0; 16];
-        key.copy_from_slice(&d1[..16]);
-        counter[..4].copy_from_slice(&d1[16..20]);
-        counter[4..].copy_from_slice(&d2[..12]);
-        Self { key, counter }
+        let mut d1 = sha1_10(&[]);
+        let mut d2 = sha1_10(&d1);
+        let mut cipher = Self {
+            key: [0; 16],
+            counter: [0; 16],
+        };
+        cipher.key.copy_from_slice(&d1[..16]);
+        cipher.counter[..4].copy_from_slice(&d1[16..20]);
+        cipher.counter[4..].copy_from_slice(&d2[..12]);
+        d1.as_mut_slice().zeroize();
+        d2.as_mut_slice().zeroize();
+        cipher
     }
 
     /// Encrypts or decrypts in place (CTR mode is symmetric).
@@ -55,6 +61,13 @@ impl NdspCipher {
         let mut out = data.to_vec();
         self.apply_keystream(&mut out);
         out
+    }
+}
+
+impl Drop for NdspCipher {
+    fn drop(&mut self) {
+        self.key.zeroize();
+        self.counter.zeroize();
     }
 }
 
@@ -108,5 +121,11 @@ mod tests {
             hex(&cipher.crypt(b"<?xml version=\"1.0\"?>")),
             "f46193cdcf0b32aff1f9dff73f10ba2b35adbd16eb"
         );
+    }
+
+    /// The key and counter must be zeroed on drop: keep the `Drop` impl.
+    #[test]
+    fn cipher_has_drop_glue() {
+        assert!(std::mem::needs_drop::<NdspCipher>());
     }
 }

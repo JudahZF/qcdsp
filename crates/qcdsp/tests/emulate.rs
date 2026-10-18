@@ -12,7 +12,7 @@ use std::{collections::HashMap, fs, path::PathBuf, process::Command};
 
 use qc_format::diff::DiffFile;
 use qcdsp::{
-    Block, Processor,
+    Block, BlockBuilder, Category, Parameter, Processor, codegen,
     device::{self, VolumeTemplate},
     examples,
 };
@@ -105,6 +105,18 @@ impl Machine {
                 }
                 if self.cpu.i[12] == RETURN && text == "nop" {
                     return None;
+                }
+            } else if text.starts_with("compu(") || text.starts_with("compu (") {
+                let operands = text
+                    .trim_start_matches("compu")
+                    .trim()
+                    .trim_start_matches('(')
+                    .trim_end_matches(')');
+                let (a, b) = operands.split_once(',').unwrap();
+                self.cpu.az = self.get(register(a.trim())) <= self.get(register(b.trim()));
+            } else if let Some(rest) = text.strip_prefix("if gt jump (pc,") {
+                if !self.cpu.az {
+                    next = pc.wrapping_add(number(rest.trim_end_matches(')')) as u32);
                 }
             } else if let Some(rest) = text.strip_prefix("if ne jump (pc,") {
                 if !self.cpu.az {
@@ -208,6 +220,10 @@ impl Machine {
             } else {
                 a.max(b)
             };
+            self.cpu.az = flags(value.to_bits());
+            value.to_bits()
+        } else if let Some(source) = rhs.strip_prefix("abs ") {
+            let value = self.float(source).abs();
             self.cpu.az = flags(value.to_bits());
             value.to_bits()
         } else if let Some(source) = rhs.strip_prefix('-') {
@@ -333,7 +349,7 @@ fn check(block: &Block, template: &VolumeTemplate, parameters: &[f32]) {
         Processor::new(block.clone()).unwrap(),
         Processor::new(block.clone()).unwrap(),
     ];
-    // Delivered values are 0..1 (the catalogue range); out-of-range values clamp.
+    // Delivered values are 0..1; invalid bit patterns leave the value unchanged.
     for (index, &normalized) in parameters.iter().enumerate() {
         assert_eq!(
             machine.call(
@@ -342,8 +358,11 @@ fn check(block: &Block, template: &VolumeTemplate, parameters: &[f32]) {
             ),
             None
         );
+        if normalized.to_bits() > 1.0_f32.to_bits() {
+            continue;
+        }
         let parameter = &block.parameters()[index];
-        let value = parameter.min + normalized.clamp(0.0, 1.0) * (parameter.max - parameter.min);
+        let value = parameter.min + normalized * (parameter.max - parameter.min);
         for host in &mut hosts {
             host.set_parameter(index, value).unwrap();
         }
@@ -363,6 +382,7 @@ fn check(block: &Block, template: &VolumeTemplate, parameters: &[f32]) {
     );
 
     machine.store(IO, BUFFER);
+    machine.store(IO + 1, BUFFER + 32);
     let state_end = STATE + built.layout.total_words;
     let mut seed = 0x1234_5678u32;
     for _ in 0..40 {
@@ -411,6 +431,36 @@ fn check(block: &Block, template: &VolumeTemplate, parameters: &[f32]) {
     }
 }
 
+/// More computed values live at once than the device has registers, plus a
+/// hoisted control value and a delay line, so the code must spill and reload.
+fn pressure() -> Block {
+    let mut dsp = BlockBuilder::new("pressure", "Pressure", Category::Utility);
+    let input = dsp.input();
+    let level = dsp
+        .parameter(Parameter::new("Level", 0.0, 1.0, 0.5).unwrap())
+        .unwrap();
+    let taper = dsp.mul(level, level).unwrap();
+    let half = dsp.constant(0.5).unwrap();
+    let wet = dsp.mul(input, half).unwrap();
+    let line = dsp.delay(3).unwrap();
+    let mut terms = Vec::new();
+    for index in 0..20 {
+        let state = dsp.state(index as f32 * 0.01).unwrap();
+        let term = dsp.mul(state.signal(), taper).unwrap();
+        let damped = dsp.mul(term, half).unwrap();
+        let next = dsp.add(damped, wet).unwrap();
+        dsp.update_state(state, next).unwrap();
+        terms.push(term);
+    }
+    let mut sum = line.signal();
+    for term in terms.into_iter().rev() {
+        sum = dsp.add(sum, term).unwrap();
+    }
+    let output = dsp.mul(sum, half).unwrap();
+    dsp.update_delay(line, output).unwrap();
+    dsp.finish(output).unwrap()
+}
+
 #[test]
 fn generated_callbacks_match_the_host_reference() {
     let Some(template) = template() else {
@@ -425,4 +475,22 @@ fn generated_callbacks_match_the_host_reference() {
         &template,
         &[],
     );
+    check(&examples::tremolo().unwrap(), &template, &[0.9, 0.7]);
+    check(
+        &examples::envelope_filter().unwrap(),
+        &template,
+        &[0.8, 0.3, 0.6, 0.9, 0.5],
+    );
+    for voicing in [examples::Voicing::Guitar, examples::Voicing::Bass] {
+        check(
+            &examples::micro_synth(voicing).unwrap(),
+            &template,
+            &[0.1, 0.7, 0.3, 0.4, 0.6, 0.2, 0.8, 0.9, 0.1, 0.7],
+        );
+    }
+    let pressure = pressure();
+    // R0-R13: the sample loop keeps R14 (delay cursor) and R15 (counter).
+    let contract = codegen::compile_with(&pressure, 0x3fff).unwrap().contract;
+    assert!(contract.spill_slots > 0 && contract.control_slots > 0);
+    check(&pressure, &template, &[0.8]);
 }

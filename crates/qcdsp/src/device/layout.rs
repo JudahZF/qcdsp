@@ -3,34 +3,39 @@
 //! ```text
 //! [0, 17)            Volume's own state (smoother etc.), initialized by stock init
 //! [17, 17+P)         parameter values, written by the generated set-parameter
-//! bank(c), c = 0, 1  per-channel memory: states, delay cursors, delay buffers
+//! [17+P, 17+P+C)     control slots: hoisted parameter math, shared by both channels
+//! bank(c), c = 0, 1  per-channel memory: states, delay cursors, spill slots, delay buffers
 //! ```
 //! All offsets are normal-word units. Generated code only accesses state through
 //! unqualified normal-word loads/stores with these offsets, which the DAG scales
 //! for byte-addressed pointers, so no pointer arithmetic is done in data registers.
 
 use super::template::{CHANNELS, STOCK_STATE_BYTES};
-use crate::{Block, Error, Result};
+use crate::{Block, Error, Result, codegen::Contract};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Layout {
     pub parameters: u32,
+    pub controls: u32,
     /// Word offset of each channel's bank.
     pub banks: [u32; CHANNELS as usize],
     /// Offsets within a bank.
     pub states: u32,
     pub cursors: u32,
+    pub spills: u32,
     /// Offset within a bank and length of each delay buffer.
     pub delays: Vec<(u32, u32)>,
     pub total_words: u32,
 }
 
 impl Layout {
-    pub fn new(block: &Block) -> Result<Self> {
+    pub fn new(block: &Block, contract: &Contract) -> Result<Self> {
         let parameters = STOCK_STATE_BYTES / 4;
+        let controls = parameters + block.parameters.len() as u32;
         let state_count = block.states.len() as u32;
         let delay_count = block.delays.len() as u32;
-        let mut bank_words = state_count + delay_count;
+        let spills = state_count + delay_count;
+        let mut bank_words = spills + contract.spill_slots;
         let mut delays = Vec::new();
         for delay in &block.delays {
             let length = u32::try_from(delay.initial)
@@ -40,7 +45,7 @@ impl Layout {
                 .checked_add(length)
                 .ok_or_else(|| Error::Invalid("delay too long".into()))?;
         }
-        let first = parameters + block.parameters.len() as u32;
+        let first = controls + contract.control_slots;
         let total_words = first
             .checked_add(
                 bank_words
@@ -50,9 +55,11 @@ impl Layout {
             .ok_or_else(|| Error::Invalid("state too large".into()))?;
         Ok(Self {
             parameters,
+            controls,
             banks: [first, first + bank_words],
             states: 0,
             cursors: state_count,
+            spills,
             delays,
             total_words,
         })

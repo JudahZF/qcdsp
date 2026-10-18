@@ -15,7 +15,10 @@ pub enum Category {
     GuitarOverdrive,
     Equalizer,
     Delay,
+    Modulation,
     Utility,
+    Pitch,
+    Filter,
 }
 
 impl Category {
@@ -24,7 +27,10 @@ impl Category {
             Self::GuitarOverdrive => 0,
             Self::Equalizer => 4,
             Self::Delay => 6,
+            Self::Modulation => 7,
             Self::Utility => 16,
+            Self::Pitch => 18,
+            Self::Filter => 24,
         }
     }
 }
@@ -132,13 +138,16 @@ pub(crate) enum Node {
     Neg {
         input: usize,
     },
+    Abs {
+        input: usize,
+    },
 }
 
 impl Node {
     pub(crate) fn operands(&self) -> Vec<usize> {
         match self {
             Self::Binary { lhs, rhs, .. } => vec![*lhs, *rhs],
-            Self::Neg { input } => vec![*input],
+            Self::Neg { input } | Self::Abs { input } => vec![*input],
             _ => vec![],
         }
     }
@@ -151,8 +160,9 @@ pub(crate) struct Memory<T> {
     pub update: Option<usize>,
 }
 
-/// A validated, topologically ordered per-sample graph. State updates happen
-/// together after the output is evaluated. Delay lengths are measured in samples.
+/// A validated, topologically ordered per-sample graph. Every state and delay
+/// read sees the previous sample; updates take effect for the next sample.
+/// Delay lengths are measured in samples.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Block {
@@ -416,6 +426,10 @@ impl BlockBuilder {
     pub fn neg(&mut self, input: Signal) -> Result<Signal> {
         let input = self.check(input)?;
         Ok(self.push(Node::Neg { input }))
+    }
+    pub fn abs(&mut self, input: Signal) -> Result<Signal> {
+        let input = self.check(input)?;
+        Ok(self.push(Node::Abs { input }))
     }
 
     pub fn finish(mut self, output: Signal) -> Result<Block> {

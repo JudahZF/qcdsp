@@ -1,11 +1,22 @@
+use qc_asm::Instruction;
+
 use crate::{
     Block, Error, Result,
+    codegen::{InputSource, Kernel, Step},
     graph::{BinaryOp, Node},
 };
 
 struct DelayBuffer {
     samples: Vec<f32>,
     cursor: usize,
+}
+
+/// Memory and registers for running a lowered kernel step by step.
+struct Lowered {
+    kernel: Kernel,
+    registers: [f32; 16],
+    controls: Vec<f32>,
+    spills: Vec<f32>,
 }
 
 /// A persistent mono host reference. Processing allocates no memory; parameters
@@ -16,8 +27,7 @@ pub struct Processor {
     states: Vec<f32>,
     delays: Vec<DelayBuffer>,
     values: Vec<f32>,
-    kernel: Option<crate::codegen::Kernel>,
-    registers: [f32; 16],
+    lowered: Option<Lowered>,
 }
 
 impl Processor {
@@ -40,18 +50,29 @@ impl Processor {
                 .collect(),
             values: vec![0.0; block.nodes.len()],
             block,
-            kernel: None,
-            registers: [0.0; 16],
+            lowered: None,
         })
     }
 
-    /// Interpret the lowered register instructions instead of the expression
-    /// graph. This checks lowering/allocation, not binary encoding or hardware
-    /// floating-point modes. State/delay storage is provided by this host harness.
+    /// Interpret the lowered steps instead of the expression graph. Loads and
+    /// stores hit this processor's memory in step order, so a write placed
+    /// before a read of the old value shows up as a wrong output. This checks
+    /// lowering and allocation, not binary encoding or SHARC float modes.
     pub fn compiled(block: Block) -> Result<Self> {
         let kernel = crate::codegen::compile(&block)?;
+        Self::lowered(block, kernel)
+    }
+
+    /// Like [`Processor::compiled`], with a kernel already compiled from `block`
+    /// (for example by `codegen::compile_with` with fewer registers).
+    pub fn lowered(block: Block, kernel: Kernel) -> Result<Self> {
         let mut processor = Self::new(block)?;
-        processor.kernel = Some(kernel);
+        processor.lowered = Some(Lowered {
+            controls: vec![0.0; kernel.contract.control_slots as usize],
+            spills: vec![0.0; kernel.contract.spill_slots as usize],
+            registers: [0.0; 16],
+            kernel,
+        });
         Ok(processor)
     }
 
@@ -85,86 +106,32 @@ impl Processor {
     }
 
     pub fn process_sample(&mut self, input: f32) -> f32 {
-        if let Some(kernel) = &self.kernel {
-            use crate::codegen::InputSource;
-            use qc_asm::Instruction;
-            for binding in &kernel.contract.inputs {
-                self.registers[binding.register as usize] = match binding.source {
-                    InputSource::Audio => input,
-                    InputSource::Parameter { index } => self.parameters[index],
-                    InputSource::State { index } => self.states[index],
-                    InputSource::Delay { index } => {
-                        let delay = &self.delays[index];
-                        delay.samples[delay.cursor]
-                    }
-                };
-            }
-            for instruction in kernel.program.instructions() {
-                let (destination, value) = match *instruction {
-                    Instruction::LoadImmediate { dst, value } => (dst, f32::from_bits(value)),
-                    Instruction::Move { dst, src } => (dst, self.registers[src.index() as usize]),
-                    Instruction::FloatAdd { dst, lhs, rhs } => (
-                        dst,
-                        self.registers[lhs.index() as usize] + self.registers[rhs.index() as usize],
-                    ),
-                    Instruction::FloatSub { dst, lhs, rhs } => (
-                        dst,
-                        self.registers[lhs.index() as usize] - self.registers[rhs.index() as usize],
-                    ),
-                    Instruction::FloatMul { dst, lhs, rhs } => (
-                        dst,
-                        self.registers[lhs.index() as usize] * self.registers[rhs.index() as usize],
-                    ),
-                    Instruction::FloatMin { dst, lhs, rhs } => (
-                        dst,
-                        self.registers[lhs.index() as usize]
-                            .min(self.registers[rhs.index() as usize]),
-                    ),
-                    Instruction::FloatMax { dst, lhs, rhs } => (
-                        dst,
-                        self.registers[lhs.index() as usize]
-                            .max(self.registers[rhs.index() as usize]),
-                    ),
-                    Instruction::FloatNeg { dst, src } => {
-                        (dst, -self.registers[src.index() as usize])
-                    }
-                    _ => unreachable!("DSP lowering emits only scalar register arithmetic"),
-                };
-                self.registers[destination.index() as usize] = value;
-            }
-            self.values[self.block.output] = self.registers[kernel.contract.output as usize];
-            for (memory, register) in self.block.states.iter().zip(&kernel.contract.state_updates) {
-                if let (Some(node), Some(register)) = (memory.update, register) {
-                    self.values[node] = self.registers[*register as usize];
+        if let Some(mut lowered) = self.lowered.take() {
+            let output = self.run_lowered(&mut lowered, input);
+            self.lowered = Some(lowered);
+            return output;
+        }
+        for (index, node) in self.block.nodes.iter().enumerate() {
+            let value = match *node {
+                Node::Input => input,
+                Node::Constant { value } => value,
+                Node::Parameter { index } => self.parameters[index],
+                Node::State { index } => self.states[index],
+                Node::Delay { index } => {
+                    let delay = &self.delays[index];
+                    delay.samples[delay.cursor]
                 }
-            }
-            for (memory, register) in self.block.delays.iter().zip(&kernel.contract.delay_updates) {
-                if let (Some(node), Some(register)) = (memory.update, register) {
-                    self.values[node] = self.registers[*register as usize];
-                }
-            }
-        } else {
-            for (index, node) in self.block.nodes.iter().enumerate() {
-                let value = match *node {
-                    Node::Input => input,
-                    Node::Constant { value } => value,
-                    Node::Parameter { index } => self.parameters[index],
-                    Node::State { index } => self.states[index],
-                    Node::Delay { index } => {
-                        let delay = &self.delays[index];
-                        delay.samples[delay.cursor]
-                    }
-                    Node::Binary { kind, lhs, rhs } => match kind {
-                        BinaryOp::Add => self.values[lhs] + self.values[rhs],
-                        BinaryOp::Sub => self.values[lhs] - self.values[rhs],
-                        BinaryOp::Mul => self.values[lhs] * self.values[rhs],
-                        BinaryOp::Min => self.values[lhs].min(self.values[rhs]),
-                        BinaryOp::Max => self.values[lhs].max(self.values[rhs]),
-                    },
-                    Node::Neg { input } => -self.values[input],
-                };
-                self.values[index] = value;
-            }
+                Node::Binary { kind, lhs, rhs } => match kind {
+                    BinaryOp::Add => self.values[lhs] + self.values[rhs],
+                    BinaryOp::Sub => self.values[lhs] - self.values[rhs],
+                    BinaryOp::Mul => self.values[lhs] * self.values[rhs],
+                    BinaryOp::Min => self.values[lhs].min(self.values[rhs]),
+                    BinaryOp::Max => self.values[lhs].max(self.values[rhs]),
+                },
+                Node::Neg { input } => -self.values[input],
+                Node::Abs { input } => self.values[input].abs(),
+            };
+            self.values[index] = value;
         }
         // Every update reads this sample's graph values, never a just-updated state.
         for (state, memory) in self.states.iter_mut().zip(&self.block.states) {
@@ -179,6 +146,57 @@ impl Processor {
             }
         }
         self.values[self.block.output]
+    }
+
+    /// The control phase runs every sample here; on the device it runs once per
+    /// 32-sample call, which is equivalent while parameters are fixed.
+    fn run_lowered(&mut self, lowered: &mut Lowered, input: f32) -> f32 {
+        let Lowered {
+            kernel,
+            registers,
+            controls,
+            spills,
+        } = lowered;
+        let mut output = f32::NAN;
+        let contract = &kernel.contract;
+        for &step in contract.control.iter().chain(&contract.sample) {
+            match step {
+                Step::Load { source, register } => {
+                    registers[register as usize] = match source {
+                        InputSource::Audio => input,
+                        InputSource::Parameter { index } => self.parameters[index],
+                        InputSource::State { index } => self.states[index],
+                        InputSource::Delay { index } => {
+                            let delay = &self.delays[index];
+                            delay.samples[delay.cursor]
+                        }
+                        InputSource::Control { slot } => controls[slot as usize],
+                    }
+                }
+                Step::Compute { instruction } => {
+                    execute(registers, kernel.program.instructions()[instruction]);
+                }
+                Step::Spill { slot, register } => {
+                    spills[slot as usize] = registers[register as usize]
+                }
+                Step::Reload { slot, register } => {
+                    registers[register as usize] = spills[slot as usize]
+                }
+                Step::StoreState { state, register } => {
+                    self.states[state] = registers[register as usize];
+                }
+                Step::StoreDelay { delay, register } => {
+                    let delay = &mut self.delays[delay];
+                    delay.samples[delay.cursor] = registers[register as usize];
+                    delay.cursor = (delay.cursor + 1) % delay.samples.len();
+                }
+                Step::StoreOutput { register } => output = registers[register as usize],
+                Step::StoreControl { slot, register } => {
+                    controls[slot as usize] = registers[register as usize];
+                }
+            }
+        }
+        output
     }
 
     pub fn process(&mut self, input: &[f32], output: &mut [f32]) -> Result<()> {
@@ -196,4 +214,21 @@ impl Processor {
             *sample = self.process_sample(*sample);
         }
     }
+}
+
+fn execute(registers: &mut [f32; 16], instruction: Instruction) {
+    let get = |register: qc_asm::Register| registers[register.index() as usize];
+    let (dst, value) = match instruction {
+        Instruction::LoadImmediate { dst, value } => (dst, f32::from_bits(value)),
+        Instruction::Move { dst, src } => (dst, get(src)),
+        Instruction::FloatAdd { dst, lhs, rhs } => (dst, get(lhs) + get(rhs)),
+        Instruction::FloatSub { dst, lhs, rhs } => (dst, get(lhs) - get(rhs)),
+        Instruction::FloatMul { dst, lhs, rhs } => (dst, get(lhs) * get(rhs)),
+        Instruction::FloatMin { dst, lhs, rhs } => (dst, get(lhs).min(get(rhs))),
+        Instruction::FloatMax { dst, lhs, rhs } => (dst, get(lhs).max(get(rhs))),
+        Instruction::FloatNeg { dst, src } => (dst, -get(src)),
+        Instruction::FloatAbs { dst, src } => (dst, get(src).abs()),
+        _ => unreachable!("DSP lowering emits only scalar register arithmetic"),
+    };
+    registers[dst.index() as usize] = value;
 }

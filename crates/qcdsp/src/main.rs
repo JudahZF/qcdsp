@@ -85,7 +85,9 @@ enum Command {
         #[arg(short, long)]
         output: PathBuf,
     },
-    /// Process a JSON array of mono f32 samples through the host reference.
+    /// Process mono audio through the host reference. Input and output are a
+    /// JSON array of f32 samples or a WAV file (by extension); WAV input is
+    /// read from its first channel and written back as 32-bit float.
     Render {
         #[command(flatten)]
         source: Source,
@@ -96,13 +98,14 @@ enum Command {
         /// Use the lowered instruction-list interpreter (not a SHARC emulator).
         #[arg(long)]
         compiled: bool,
-        /// Set a parameter by index, e.g. --param 0=2.0. Values are DSP units.
+        /// Set a parameter by index or name, e.g. --param 0=2.0 or
+        /// --param "start freq=0.8". Values are DSP units.
         #[arg(long = "param", value_parser = parse_parameter)]
-        parameters: Vec<(usize, f32)>,
+        parameters: Vec<(String, f32)>,
     },
     /// Read a decrypted ModuleBlob and print section sizes, without dumping data.
     Inspect { blob: PathBuf },
-    /// Stage a stock volume clone (the postplan's M1 install test). No installation.
+    /// Stage a stock volume clone (an install test of the framework alone). No installation.
     StageClone {
         #[command(flatten)]
         device: DeviceArgs,
@@ -260,6 +263,10 @@ enum Example {
     Biquad,
     Delay,
     SoftClip,
+    Tremolo,
+    EnvelopeFilter,
+    MicroSynth,
+    BassMicroSynth,
 }
 
 impl Source {
@@ -274,6 +281,10 @@ impl Source {
             }
             Example::Delay => examples::delay(self.delay_samples)?,
             Example::SoftClip => examples::soft_clip()?,
+            Example::Tremolo => examples::tremolo()?,
+            Example::EnvelopeFilter => examples::envelope_filter()?,
+            Example::MicroSynth => examples::micro_synth(examples::Voicing::Guitar)?,
+            Example::BassMicroSynth => examples::micro_synth(examples::Voicing::Bass)?,
         })
     }
 }
@@ -291,14 +302,75 @@ struct FragmentManifest<'a> {
     required_runtime: &'static str,
 }
 
-fn parse_parameter(value: &str) -> Result<(usize, f32), String> {
-    let (index, value) = value.split_once('=').ok_or("use INDEX=VALUE")?;
-    let index = index.parse().map_err(|_| "invalid parameter index")?;
+fn parse_parameter(value: &str) -> Result<(String, f32), String> {
+    let (key, value) = value
+        .rsplit_once('=')
+        .ok_or("use INDEX=VALUE or NAME=VALUE")?;
     let value: f32 = value.parse().map_err(|_| "invalid parameter value")?;
     if !value.is_finite() {
         return Err("parameter value must be finite".into());
     }
-    Ok((index, value))
+    Ok((key.trim().to_owned(), value))
+}
+
+fn parameter_index(block: &Block, key: &str) -> Result<usize, Box<dyn Error>> {
+    if let Ok(index) = key.parse() {
+        return Ok(index);
+    }
+    block
+        .parameters()
+        .iter()
+        .position(|parameter| parameter.name.eq_ignore_ascii_case(key))
+        .ok_or_else(|| format!("{} has no parameter {key:?}", block.name()).into())
+}
+
+fn is_wav(path: &Path) -> bool {
+    path.extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("wav"))
+}
+
+/// Mono samples and their sample rate (48 kHz for JSON).
+fn read_samples(path: &Path) -> Result<(Vec<f32>, u32), Box<dyn Error>> {
+    if !is_wav(path) {
+        return Ok((serde_json::from_slice(&fs::read(path)?)?, 48_000));
+    }
+    let mut reader = hound::WavReader::open(path)?;
+    let spec = reader.spec();
+    let channels = usize::from(spec.channels);
+    let samples: Vec<f32> = match spec.sample_format {
+        hound::SampleFormat::Float => reader.samples::<f32>().collect::<Result<_, _>>()?,
+        hound::SampleFormat::Int => {
+            let scale = 2f32.powi(i32::from(spec.bits_per_sample) - 1);
+            reader
+                .samples::<i32>()
+                .map(|sample| sample.map(|sample| sample as f32 / scale))
+                .collect::<Result<_, _>>()?
+        }
+    };
+    Ok((
+        samples.into_iter().step_by(channels).collect(),
+        spec.sample_rate,
+    ))
+}
+
+fn write_samples(path: &Path, samples: &[f32], sample_rate: u32) -> Result<(), Box<dyn Error>> {
+    if !is_wav(path) {
+        return write_new(path, &serde_json::to_vec(samples)?);
+    }
+    let spec = hound::WavSpec {
+        channels: 1,
+        sample_rate,
+        bits_per_sample: 32,
+        sample_format: hound::SampleFormat::Float,
+    };
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    let mut writer = hound::WavWriter::new(std::io::BufWriter::new(options.open(path)?), spec)?;
+    for &sample in samples {
+        writer.write_sample(sample)?;
+    }
+    writer.finalize()?;
+    Ok(())
 }
 
 fn write_new(path: &Path, data: &[u8]) -> Result<(), Box<dyn Error>> {
@@ -386,7 +458,7 @@ fn run() -> Result<(), Box<dyn Error>> {
             let kernel = codegen::compile(&block)?;
             let code = kernel.encode()?;
             let manifest = serde_json::to_vec_pretty(&FragmentManifest {
-                format: "qcdsp.scalar-fragment.v1",
+                format: "qcdsp.scalar-fragment.v2",
                 installable: false,
                 block: block.blob_name(),
                 code_mode: "isa48",
@@ -394,7 +466,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                 section: 3,
                 address_unit_bytes: 6,
                 contract: &kernel.contract,
-                required_runtime: "Load register bindings and commit state/delay writes per sample. QC callbacks, memory layout and ISA/VISA transition are not implemented.",
+                required_runtime: "Run the control steps once per call, then the sample steps per sample, mapping loads, spills and stores onto your memory. Compute steps index kernel.isa48. QC callbacks, memory layout and ISA/VISA transition are not implemented.",
             })?;
             let ir = block.to_json()?;
             if let Some(parent) = output.parent().filter(|path| !path.as_os_str().is_empty()) {
@@ -426,25 +498,30 @@ fn run() -> Result<(), Box<dyn Error>> {
             parameters,
         } => {
             let block = source.load()?;
-            let mut samples: Vec<f32> = serde_json::from_slice(&fs::read(input)?)?;
+            let (mut samples, sample_rate) = read_samples(&input)?;
             if samples.iter().any(|sample| !sample.is_finite()) {
                 return Err("input samples must be finite".into());
             }
+            if sample_rate != 48_000 {
+                eprintln!("qcdsp: input is {sample_rate} Hz; blocks are tuned for the QC's 48 kHz");
+            }
+            let indices = parameters
+                .iter()
+                .map(|(key, value)| Ok((parameter_index(&block, key)?, *value)))
+                .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
             let mut processor = if compiled {
                 Processor::compiled(block)?
             } else {
                 Processor::new(block)?
             };
-            for (index, value) in parameters {
+            for (index, value) in indices {
                 processor.set_parameter(index, value)?;
             }
             processor.process_in_place(&mut samples);
             if samples.iter().any(|sample| !sample.is_finite()) {
-                return Err(
-                    "DSP output is non-finite; refusing to serialize it as JSON null".into(),
-                );
+                return Err("DSP output is non-finite; refusing to write it".into());
             }
-            write_new(&output, &serde_json::to_vec(&samples)?)?;
+            write_samples(&output, &samples, sample_rate)?;
             println!(
                 "Rendered {} mono samples to {}",
                 samples.len(),

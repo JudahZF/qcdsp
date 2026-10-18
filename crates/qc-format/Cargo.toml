@@ -9,10 +9,13 @@ repository.workspace = true
 description = "Quad Cortex block file formats: ModuleBlob, per-core diff records, metadata XML edits and NDSP crypto"
 
 [dependencies]
-aes.workspace = true
-ctr.workspace = true
-sha1.workspace = true
+# `zeroize`: the AES key schedule, the CTR state and the SHA-1 cores of the key derivation are
+# zeroed on drop.
+aes = { workspace = true, features = ["zeroize"] }
+ctr = { workspace = true, features = ["zeroize"] }
+sha1 = { workspace = true, features = ["zeroize"] }
 thiserror.workspace = true
+zeroize = "1.9"
 
 [lints]
 workspace = true

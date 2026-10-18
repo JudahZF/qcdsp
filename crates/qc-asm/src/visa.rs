@@ -86,6 +86,8 @@ pub enum Condition {
     Sz,
     NotSv,
     Always,
+    /// Unsigned greater-than after COMPU (AN=0 and AZ=0).
+    UnsignedGt,
 }
 
 impl Condition {
@@ -97,6 +99,7 @@ impl Condition {
             Self::Sz => 8,
             Self::NotSv => 23,
             Self::Always => 31,
+            Self::UnsignedGt => 18,
         }
     }
 }
@@ -195,6 +198,11 @@ pub enum VisaInstruction {
         dst: Register,
         src: Register,
     },
+    /// Integer unsigned comparison; sets AZ and AN, with no destination.
+    IntegerCompareUnsigned {
+        lhs: Register,
+        rhs: Register,
+    },
     /// Type 8a: offset is relative to the first parcel of this instruction.
     /// A delayed jump does not insert or validate its two delay-slot instructions.
     JumpRelative {
@@ -277,6 +285,9 @@ impl VisaInstruction {
             }
             Self::IntegerSubOne { dst, src } => compute(0, 0x2a, dst, src, 0),
             Self::IntegerPass { dst, src } => compute(0, 0x21, dst, src, 0),
+            Self::IntegerCompareUnsigned { lhs, rhs } => {
+                compute(0, 0x0b, Register::new(0).expect("R0"), lhs, rhs.index())
+            }
             Self::JumpRelative {
                 condition,
                 offset,

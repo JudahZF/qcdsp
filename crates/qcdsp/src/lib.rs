@@ -23,7 +23,7 @@ pub enum Error {
     ParameterRange { name: String, min: f32, max: f32 },
     #[error("DSP value {0} is not supported by this code generator")]
     Unsupported(String),
-    #[error("kernel needs more than 16 data registers; no spilling is implemented")]
+    #[error("too few data registers: one operation needs up to three")]
     RegisterPressure,
     #[error(transparent)]
     Json(#[from] serde_json::Error),

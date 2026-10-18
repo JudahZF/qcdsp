@@ -1,7 +1,7 @@
 //! Installable Quad Cortex blocks.
 //!
-//! A [`Block`] is compiled into three VISA callbacks (init, process,
-//! set-parameter) that are appended to the stock Volume framework from the
+//! A [`Block`] is compiled into four VISA routines (init, process,
+//! set-parameter, fault recovery) that are appended to the stock Volume framework from the
 //! user's own firmware. The result is a core 1 ModuleBlob, the core 2-4 diff
 //! records and the two catalogue entries; `qc-deploy` encrypts and installs them.
 
@@ -15,11 +15,12 @@ use qc_format::{
     diff::DiffRecord,
 };
 
+pub use emit::Generated;
 pub use layout::Layout;
 pub use metadata::Resources;
 pub use template::{Entries, VolumeTemplate};
 
-use crate::{Block, Result};
+use crate::{Block, Result, codegen};
 
 /// Prefix of every generated blob name.
 pub const BLOB_PREFIX: &str = "qcdsp_";
@@ -38,6 +39,17 @@ pub struct DeviceBlock {
     pub entries: Entries,
 }
 
+/// The generated routines of `block` and its state layout, without the stock template: the
+/// parcels start at [`template::STOCK_PARCELS`] of the Volume code section, and `entries` are
+/// offsets in parcels from its start. A SHARC+ model can run them (Tetrad's `tetrad-sharc`
+/// tests do).
+pub fn generate(block: &Block) -> Result<(Layout, Generated)> {
+    let kernel = codegen::compile_with(block, emit::kernel_registers(block))?;
+    let layout = Layout::new(block, &kernel.contract)?;
+    let generated = emit::generate(block, &layout, &kernel)?;
+    Ok((layout, generated))
+}
+
 /// Compile `block` for the device. `model_id` must be unused in the catalogue;
 /// `qc-deploy` checks that against the user's snapshot before staging.
 pub fn build(
@@ -53,8 +65,7 @@ pub fn build(
         block.blob_name().trim_start_matches(BLOB_PREFIX)
     );
     qc_format::blob::validate_blob_name(&blob_name)?;
-    let layout = Layout::new(block)?;
-    let generated = emit::generate(block, &layout)?;
+    let (layout, generated) = generate(block)?;
     let (core1, diffs) = template.link(
         &blob_name,
         &generated.parcels,

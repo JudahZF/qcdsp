@@ -105,6 +105,43 @@ fn exported_ir_can_be_imported_and_rendered_in_both_execution_modes() {
 }
 
 #[test]
+fn wav_render_reads_the_first_channel_and_takes_parameter_names() {
+    let scratch = Scratch::new();
+    let spec = hound::WavSpec {
+        channels: 2,
+        sample_rate: 48_000,
+        bits_per_sample: 16,
+        sample_format: hound::SampleFormat::Int,
+    };
+    let mut writer = hound::WavWriter::create(scratch.0.join("in.wav"), spec).unwrap();
+    for sample in [16384i16, 1000, -8192, 1000] {
+        writer.write_sample(sample).unwrap();
+    }
+    writer.finalize().unwrap();
+    let args = [
+        "render",
+        "--example",
+        "gain",
+        "--input",
+        "in.wav",
+        "--output",
+        "out.wav",
+        "--param",
+        "gain=2",
+    ];
+    let result = scratch.run(&args);
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let mut reader = hound::WavReader::open(scratch.0.join("out.wav")).unwrap();
+    assert_eq!(reader.spec().channels, 1);
+    let samples: Vec<f32> = reader.samples::<f32>().map(Result::unwrap).collect();
+    assert_eq!(samples, [1.0, -0.5]);
+}
+
+#[test]
 fn invalid_sources_and_non_finite_parameters_do_not_create_output() {
     let scratch = Scratch::new();
     assert!(

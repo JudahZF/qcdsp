@@ -24,6 +24,23 @@ fn u(code: u8) -> UniversalRegister {
 fn vectors() -> Vec<(VisaInstruction, Vec<u16>, &'static str)> {
     vec![
         (
+            VisaInstruction::IntegerCompareUnsigned {
+                lhs: r(12),
+                rhs: r(0),
+            },
+            vec![0x013e, 0x0000, 0xb0c0],
+            "COMPU(R12,R0)",
+        ),
+        (
+            VisaInstruction::JumpRelative {
+                condition: Condition::UnsignedGt,
+                offset: 8,
+                delayed: false,
+            },
+            vec![0x0724, 0, 8],
+            "IF GT JUMP(PC,0x8)",
+        ),
+        (
             Instruction::FloatAdd {
                 dst: r(0),
                 lhs: r(1),

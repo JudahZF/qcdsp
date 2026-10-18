@@ -1,10 +1,12 @@
 //! The stock `volume` block used as a framework for generated blocks.
 //!
-//! Generated blocks keep Volume's entry, allocation, smoother, reset and destroy
-//! code and replace three things: the state allocation size, the init call
-//! target, and the process and set-parameter callback pointers. The bytes come
+//! Generated blocks keep Volume's allocation, smoother, reset and destroy code.
+//! They patch the allocation size, init call, process and parameter pointers.
+//! An entry wrapper also installs the generated fault-recovery callback. The bytes come
 //! from the user's own decrypted firmware and are pinned by SHA-256 and by the
 //! exact words at every patch point, so a different build is refused, not patched.
+
+use qc_asm::{Condition, IndexRegister, Register, VisaInstruction as V, VisaProgram};
 
 use qc_format::{
     blob::{ModuleBlob, Section},
@@ -24,7 +26,7 @@ pub const STOCK_PARCELS: u32 = 0x27a;
 pub const STOCK_STATE_BYTES: u32 = 0x44;
 /// Stock init function; the generated init tail-jumps here.
 pub const STOCK_INIT: u32 = 0xe2;
-/// Samples per channel per process call, and channels in the planar buffer.
+/// Samples per channel per process call, and channel pointers in the descriptor.
 pub const BLOCK_SAMPLES: u32 = 32;
 pub const CHANNELS: u32 = 2;
 /// Volume's report figures, which the generated block extends.
@@ -66,6 +68,7 @@ pub struct Entries {
     pub init: u32,
     pub process: u32,
     pub set_parameter: u32,
+    pub recovery: u32,
 }
 
 pub struct VolumeTemplate {
@@ -210,7 +213,38 @@ fn patch(
     let section = blob.content_mut(Section::Code).expect("checked");
     set_parcel(section, ALLOC.parcel + 1, state_bytes as u16);
     section.extend(code.iter().flat_map(|parcel| parcel.to_le_bytes()));
+    // Install ctx[14] before tail-jumping to Volume's allocating entry.
+    // Volume installs its other callbacks without changing this slot.
+    let entry = section.len() as u32 / 2;
+    let mut wrapper = VisaProgram::new();
+    wrapper.push(V::Transfer {
+        dst: IndexRegister::new(4)?.into(),
+        src: Register::new(4)?.into(),
+    });
+    wrapper.push(V::LoadImmediate {
+        dst: Register::new(0)?.into(),
+        value: Section::Code.base() + entries.recovery,
+    });
+    wrapper.push(V::StoreDmOffset {
+        src: Register::new(0)?.into(),
+        index: IndexRegister::new(4)?,
+        offset: 14,
+    });
+    let at = entry + wrapper.parcels()?.len() as u32;
+    wrapper.push(V::JumpRelative {
+        condition: Condition::Always,
+        offset: 0x150 - at as i32,
+        delayed: false,
+    });
+    section.extend(wrapper.parcels()?.into_iter().flat_map(u16::to_le_bytes));
     let length = section.len();
+    blob.entry = Section::Code.base() + entry;
+    blob.relocations
+        .iter_mut()
+        .find(|group| group.section == Section::Code)
+        .expect("checked")
+        .words
+        .extend([8, entry + 2, Section::Code.base(), entries.recovery]);
     retarget(&mut blob, &INIT_CALL, entries.init)?;
     retarget(&mut blob, &PROCESS_PTR, entries.process)?;
     retarget(&mut blob, &SETPARAM_PTR, entries.set_parameter)?;
