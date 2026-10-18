@@ -5,11 +5,16 @@ guarded SSH device deployment. Planning and dry runs never connect to a device.
 
 ## Stock-clone API
 
-1. Load an explicit `FirmwarePin` with the trusted SHA-256 of `ZenUI` and all
-   five `RUNTIME_FILES`. These are **on-disk/encrypted hashes** from the supported
-   firmware copy, not the Python installer's plaintext runtime hashes. Unknown,
-   incomplete, or mismatched identity is refused. No vendor hashes are embedded.
-2. Open `Snapshot::open(copied_neuraldsp_root, pin)`. Supply the root of a local
+1. Make the set of accepted `FirmwarePin`s. Each pin holds the SHA-256 of `ZenUI`
+   and all five `RUNTIME_FILES` of one build. These are **on-disk/encrypted hashes**,
+   not the Python installer's plaintext runtime hashes. `known_pins(&kernels)` makes
+   the pins of the supported builds (`KNOWN_BUILDS`: CorOS 4.1.0 and 4.1.1). The
+   crate records only the hashes that are the same on every unit. The installer
+   translates the two `ZPUKernel` files per unit, so their hashes come from the
+   user's own trusted copy as a `KernelPin`. A tree that matches no pin exactly
+   is refused.
+2. Open `Snapshot::open(copied_neuraldsp_root, &pins)`. It keeps the pin of the build
+   that matched. Supply the root of a local
    **copy** of `opt/neuraldsp`, not the live path or a device-mounted tree.
 3. Call `clone_stock(&snapshot, Secrets { repo, blob, report }, spec)`.
    `CloneSpec::volume(new_id, name, new_blob)` defaults to source `volume`, Utility
@@ -83,16 +88,17 @@ let mut opts = qc_deploy::DeviceOptions {
     dry_run: true,
     confirm_device_write: false,
 };
-let plan = qc_deploy::plan_install(&stage, &pin, &opts)?; // local only
-let commands = plan.commands(&transport)?;              // local only
-qc_deploy::install(&mut transport, &stage, &pin, &opts)?; // prints; NO connection
+let pins = qc_deploy::known_pins(&kernels);
+let plan = qc_deploy::plan_install(&stage, &pins, &opts)?; // local only
+let commands = plan.commands(&transport)?;               // local only
+qc_deploy::install(&mut transport, &stage, &pins, &opts)?; // prints; NO connection
 // Only after separate user approval:
 opts.dry_run = false;
 opts.confirm_device_write = true;
-qc_deploy::install(&mut transport, &stage, &pin, &opts)?;
-// Use the SAME token, serial, backup directory and explicit firmware pin:
-qc_deploy::plan_uninstall(&pin, &opts)?; // local verification and planning only
-qc_deploy::uninstall(&mut transport, &pin, &opts)?;
+qc_deploy::install(&mut transport, &stage, &pins, &opts)?;
+// Use the SAME token, serial, backup directory and firmware pins:
+qc_deploy::plan_uninstall(&pins, &opts)?; // local verification and planning only
+qc_deploy::uninstall(&mut transport, &pins, &opts)?;
 ```
 
 `install` and `uninstall` refuse an unconfirmed real run before contacting the
@@ -103,9 +109,11 @@ the associated bytes are held in the plan's `RemoteOperation::Upload`. Printed
 commands are an approval report, not a standalone replay script. `Installed` and
 `Uninstalled` outcomes return the durable receipt.
 
-An explicitly requested `preflight(transport, stage, pin)` is read-only but **does
+The stage's firmware pin must be one of `pins`. The device is then checked against
+the stage's pin, so a stage made from one build installs only on that build.
+An explicitly requested `preflight(transport, stage, &pins)` is read-only but **does
 connect**. It checks ZenUI and all five encrypted/on-disk runtime SHA-256 values
-against the explicit pin, reads `/etc/qc_sn`, and lists the six target paths. Unknown
+against the stage's pin, reads `/etc/qc_sn`, and lists the six target paths. Unknown
 or mismatched firmware is refused. No automatic pin discovery or acceptance occurs.
 Install and uninstall also bind the receipt to the caller's explicit serial.
 

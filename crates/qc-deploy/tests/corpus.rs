@@ -80,10 +80,10 @@ fn stock_volume_payload_stages_applies_and_restores_on_a_private_copy() {
     }
     let snapshot = Snapshot::open(
         &root,
-        FirmwarePin {
+        &[FirmwarePin {
             zenui_sha256: sha256(zenui),
             runtime_sha256,
-        },
+        }],
     )
     .unwrap();
     let clone = clone_stock(

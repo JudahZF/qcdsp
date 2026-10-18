@@ -125,7 +125,7 @@ struct DeviceArgs {
     /// Local copy of the device's /opt/neuraldsp (never the live path).
     #[arg(long)]
     snapshot: PathBuf,
-    /// JSON FirmwarePin with trusted ZenUI and runtime SHA-256 hashes.
+    /// JSON KernelPin: the SHA-256 of this unit's two ZPUKernel files.
     #[arg(long)]
     pin: PathBuf,
     /// Private (0600) file of hex lines: repo key, blob key and report seed.
@@ -138,8 +138,7 @@ struct DeviceArgs {
 
 impl DeviceArgs {
     fn open(&self) -> Result<(qc_deploy::Snapshot, keys::DeviceSecrets), Box<dyn Error>> {
-        let pin: qc_deploy::FirmwarePin = serde_json::from_slice(&fs::read(&self.pin)?)?;
-        let snapshot = qc_deploy::Snapshot::open(&self.snapshot, pin)?;
+        let snapshot = qc_deploy::Snapshot::open(&self.snapshot, &known_pins(&self.pin)?)?;
         let secrets = keys::load(snapshot.root(), &self.keys, &self.serial_file)?;
         Ok((snapshot, secrets))
     }
@@ -147,6 +146,7 @@ impl DeviceArgs {
 
 #[derive(Args)]
 struct TargetArgs {
+    /// JSON KernelPin: the SHA-256 of this unit's two ZPUKernel files.
     #[arg(long)]
     pin: PathBuf,
     /// File holding the expected device serial (/etc/qc_sn).
@@ -180,8 +180,8 @@ impl TargetArgs {
 
     fn options(
         &self,
-    ) -> Result<(qc_deploy::FirmwarePin, qc_deploy::DeviceOptions), Box<dyn Error>> {
-        let pin = serde_json::from_slice(&fs::read(&self.pin)?)?;
+    ) -> Result<(Vec<qc_deploy::FirmwarePin>, qc_deploy::DeviceOptions), Box<dyn Error>> {
+        let pins = known_pins(&self.pin)?;
         let options = qc_deploy::DeviceOptions {
             token: self.token.clone(),
             expected_serial: fs::read_to_string(&self.serial_file)?.trim().to_owned(),
@@ -189,8 +189,14 @@ impl TargetArgs {
             dry_run: !self.confirm_device_write,
             confirm_device_write: self.confirm_device_write,
         };
-        Ok((pin, options))
+        Ok((pins, options))
     }
+}
+
+/// The pins of the supported CorOS builds for the unit whose kernel pin is at `path`.
+fn known_pins(path: &Path) -> Result<Vec<qc_deploy::FirmwarePin>, Box<dyn Error>> {
+    let kernels: qc_deploy::KernelPin = serde_json::from_slice(&fs::read(path)?)?;
+    Ok(qc_deploy::known_pins(&kernels))
 }
 
 fn report(outcome: qc_deploy::InstallOutcome) {
@@ -414,8 +420,10 @@ fn run() -> Result<(), Box<dyn Error>> {
             };
             // Writes the new stage directory; the snapshot is not modified.
             qc_deploy::stage_generated(&snapshot, secrets.as_secrets(), &generated, &output)?;
+            let version = qc_deploy::KnownBuild::of(snapshot.firmware_pin())
+                .map_or("unknown", |build| build.version);
             println!(
-                "Built {name}: {} code bytes, {} state bytes, reported CPU {:.3}.\nStage: {}\nInstall with `cargo qcdsp install --stage ...` (dry run by default).",
+                "Built {name} for CorOS {version}: {} code bytes, {} state bytes, reported CPU {:.3}.\nStage: {}\nInstall with `cargo qcdsp install --stage ...` (dry run by default).",
                 built.resources.code_bytes,
                 built.resources.state_bytes,
                 built.resources.cpu(),
@@ -423,20 +431,20 @@ fn run() -> Result<(), Box<dyn Error>> {
             );
         }
         Command::Install { stage, target } => {
-            let (pin, options) = target.options()?;
+            let (pins, options) = target.options()?;
             let stage = qc_deploy::DeviceStage::open(&stage)?;
             report(qc_deploy::install(
                 &mut target.transport()?,
                 &stage,
-                &pin,
+                &pins,
                 &options,
             )?);
         }
         Command::Uninstall { target } => {
-            let (pin, options) = target.options()?;
+            let (pins, options) = target.options()?;
             report(qc_deploy::uninstall(
                 &mut target.transport()?,
-                &pin,
+                &pins,
                 &options,
             )?);
         }

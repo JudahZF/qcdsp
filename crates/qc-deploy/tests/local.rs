@@ -2,6 +2,7 @@ use std::{
     collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
+    slice,
     sync::atomic::{AtomicU64, Ordering},
 };
 
@@ -116,7 +117,7 @@ impl Fixture {
     }
 
     fn snapshot(&self) -> Snapshot {
-        Snapshot::open(&self.tree, self.pin.clone()).unwrap()
+        Snapshot::open(&self.tree, slice::from_ref(&self.pin)).unwrap()
     }
 
     fn assert_original(&self) {
@@ -271,7 +272,16 @@ fn unknown_or_changed_firmware_fails_closed() {
     let mut missing = fixture.pin.clone();
     missing.runtime_sha256.clear();
     assert!(matches!(
-        Snapshot::open(&fixture.tree, missing),
+        Snapshot::open(&fixture.tree, &[missing]),
+        Err(Error::Firmware(_))
+    ));
+    // The tree opens if any pinned build matches it, and keeps that build's pin.
+    let mut other_build = fixture.pin.clone();
+    other_build.zenui_sha256 = sha256(b"another firmware build");
+    let opened = Snapshot::open(&fixture.tree, &[other_build.clone(), fixture.pin.clone()]);
+    assert_eq!(opened.unwrap().firmware_pin(), &fixture.pin);
+    assert!(matches!(
+        Snapshot::open(&fixture.tree, &[other_build]),
         Err(Error::Firmware(_))
     ));
     let snapshot = fixture.snapshot();
@@ -439,7 +449,13 @@ fn symlinks_hardlinks_and_permission_changes_are_not_hidden() {
         0o640
     );
     symlink(&fixture.tree, fixture.directory.join("alias")).unwrap();
-    assert!(Snapshot::open(fixture.directory.join("alias"), fixture.pin.clone()).is_err());
+    assert!(
+        Snapshot::open(
+            fixture.directory.join("alias"),
+            slice::from_ref(&fixture.pin)
+        )
+        .is_err()
+    );
     fs::hard_link(
         fixture.tree.join("ModelRepo.xml"),
         fixture.directory.join("linked-resource"),

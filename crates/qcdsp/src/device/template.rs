@@ -16,8 +16,9 @@ use sha2::{Digest, Sha256};
 
 use crate::{Error, Result};
 
-/// SHA-256 of the decrypted `volume` ModuleBlob from CorOS 4.1.0. Only the hash
-/// is recorded here; the blob itself is read from the user's device data.
+/// SHA-256 of the decrypted `volume` ModuleBlob. The blob and its per-core records
+/// are byte-equal in every build of `qc_deploy::KNOWN_BUILDS` (CorOS 4.1.0 and
+/// 4.1.1). Only the hash is recorded here; the blob is read from the user's device data.
 pub const VOLUME_SHA256: &str = "2895ac789b87f1ce46b1d5551acc7ba081372a58e66c1ea6f3abc96fdf06f5ae";
 
 /// Stock code length in 16-bit parcels. Generated functions are appended after it.
@@ -86,7 +87,7 @@ impl VolumeTemplate {
             .collect();
         if hash != VOLUME_SHA256 {
             return Err(Error::Template(format!(
-                "volume blob sha256 {hash} is not the supported CorOS 4.1.0 build"
+                "volume blob sha256 {hash} is not the Volume blob of a supported CorOS build"
             )));
         }
         let blob = ModuleBlob::parse(core1)?;

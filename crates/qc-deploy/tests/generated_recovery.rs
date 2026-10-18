@@ -79,7 +79,7 @@ fn generated_local_recovery_refuses_edits_and_accepts_partial_original_states() 
         zenui_sha256: sha256(b"synthetic ZenUI"),
         runtime_sha256,
     };
-    let snapshot = Snapshot::open(&tree, pin).unwrap();
+    let snapshot = Snapshot::open(&tree, &[pin]).unwrap();
     let block = GeneratedBlock {
         blob_name: "generated".into(),
         model_id: "2".into(),

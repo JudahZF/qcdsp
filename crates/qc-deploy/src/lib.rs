@@ -4,6 +4,7 @@
 //! dry runs never connect. There is no key discovery or reboot API.
 //! Each replacement is atomic for one file only; a multi-file install is not atomic.
 
+mod builds;
 mod clone;
 mod device;
 mod fs;
@@ -17,6 +18,7 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
+pub use builds::{KNOWN_BUILDS, KernelPin, KnownBuild, known_pins};
 pub use clone::{CloneSpec, Secrets, clone_stock};
 pub use device::{
     DeviceFacts, DeviceManifest, DeviceOptions, DevicePlan, DeviceReceipt, DeviceStage,
@@ -43,7 +45,7 @@ pub enum Error {
     Invalid(String),
     #[error("unsafe local path: {0}")]
     UnsafePath(PathBuf),
-    #[error("firmware identity is unknown or does not match the explicit pin: {0}")]
+    #[error("firmware identity is unknown or does not match a pinned build: {0}")]
     Firmware(String),
     #[error("tree changed: {0}; refusing to overwrite it")]
     Changed(String),
@@ -66,9 +68,10 @@ pub enum Error {
     },
 }
 
-/// These are encrypted/on-disk hashes, not the Python toolkit's plaintext hashes.
-/// Supply trusted hashes from the exact supported firmware snapshot. There is no
-/// built-in allowlist and no automatic acceptance of the current tree's identity.
+/// The on-disk SHA-256 of ZenUI and the five runtime files of one firmware build
+/// on one unit. These are encrypted/on-disk hashes, not the Python toolkit's
+/// plaintext hashes. [`known_pins`] makes the pins of the supported builds;
+/// the current tree's identity is never accepted automatically.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FirmwarePin {
@@ -102,19 +105,60 @@ impl FirmwarePin {
         Ok(())
     }
 
-    fn verify(&self, root: &Path) -> Result<()> {
-        self.validate()?;
-        for (path, expected) in std::iter::once(("ZenUI".to_owned(), &self.zenui_sha256)).chain(
+    /// Each pinned path under `/opt/neuraldsp` with its expected hash.
+    fn entries(&self) -> impl Iterator<Item = (String, &String)> {
+        std::iter::once(("ZenUI".to_owned(), &self.zenui_sha256)).chain(
             self.runtime_sha256
                 .iter()
                 .map(|(name, hash)| (format!("sharc_binaries/{name}"), hash)),
-        ) {
-            if fs::hash_file(root, &path)?.as_ref() != Some(expected) {
-                return Err(Error::Firmware(path));
-            }
-        }
-        Ok(())
+        )
     }
+
+    /// The first pinned path whose hash in `found` differs.
+    fn mismatch(&self, found: &BTreeMap<String, Option<String>>) -> Option<String> {
+        self.entries()
+            .find(|(path, expected)| found.get(path).and_then(Option::as_ref) != Some(*expected))
+            .map(|(path, _)| path)
+    }
+
+    fn verify(&self, root: &Path) -> Result<()> {
+        self.validate()?;
+        match self.mismatch(&hash_pinned(root)?) {
+            Some(path) => Err(Error::Firmware(path)),
+            None => Ok(()),
+        }
+    }
+}
+
+/// The on-disk hash of every pinned path in `root` (`None` if it is missing).
+fn hash_pinned(root: &Path) -> Result<BTreeMap<String, Option<String>>> {
+    std::iter::once("ZenUI".to_owned())
+        .chain(
+            RUNTIME_FILES
+                .iter()
+                .map(|name| format!("sharc_binaries/{name}")),
+        )
+        .map(|path| Ok((path.clone(), fs::hash_file(root, &path)?)))
+        .collect()
+}
+
+/// The pin in `pins` that every hash in `found` matches. Any other build is refused.
+fn select<'a>(
+    pins: &'a [FirmwarePin],
+    found: &BTreeMap<String, Option<String>>,
+) -> Result<&'a FirmwarePin> {
+    let mut mismatches = Vec::new();
+    for pin in pins {
+        pin.validate()?;
+        match pin.mismatch(found) {
+            None => return Ok(pin),
+            Some(path) => mismatches.push(path),
+        }
+    }
+    Err(Error::Firmware(format!(
+        "no pinned build matches (first difference per build: {})",
+        mismatches.join(", ")
+    )))
 }
 
 /// An explicitly selected local copy. Symlinks and hardlinked resource files are
@@ -126,9 +170,10 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
-    pub fn open(copied_neuraldsp_root: impl AsRef<Path>, pin: FirmwarePin) -> Result<Self> {
+    /// Opens the copy if its firmware matches one of `pins` exactly.
+    pub fn open(copied_neuraldsp_root: impl AsRef<Path>, pins: &[FirmwarePin]) -> Result<Self> {
         let root = fs::root(copied_neuraldsp_root.as_ref())?;
-        pin.verify(&root)?;
+        let pin = select(pins, &hash_pinned(&root)?)?.clone();
         Ok(Self { root, pin })
     }
 
@@ -136,6 +181,7 @@ impl Snapshot {
         &self.root
     }
 
+    /// The pin of the build that this copy matched.
     pub fn firmware_pin(&self) -> &FirmwarePin {
         &self.pin
     }

@@ -2,6 +2,7 @@ use std::{
     collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
+    slice,
     sync::atomic::{AtomicU64, Ordering},
 };
 
@@ -136,7 +137,7 @@ impl Fixture {
     }
 
     fn snapshot(&self) -> Snapshot {
-        Snapshot::open(&self.tree, self.pin.clone()).unwrap()
+        Snapshot::open(&self.tree, slice::from_ref(&self.pin)).unwrap()
     }
     fn stage(&self) -> DeviceStage {
         stage_generated(
@@ -313,11 +314,11 @@ fn fake_transport_installs_and_uninstalls_generated_and_stock_stages() {
         let blob = stage.manifest().blob.clone();
         let mut transport = f.transport();
         let opts = f.opts();
-        let facts = preflight(&mut transport, &stage, &f.pin).unwrap();
+        let facts = preflight(&mut transport, &stage, slice::from_ref(&f.pin)).unwrap();
         assert_eq!(facts.serial, SERIAL);
         assert!(facts.target_listing.contains("ModelRepo.xml"));
         assert!(matches!(
-            install(&mut transport, &stage, &f.pin, &opts).unwrap(),
+            install(&mut transport, &stage, slice::from_ref(&f.pin), &opts).unwrap(),
             InstallOutcome::Installed { .. }
         ));
         f.assert_installed(&stage);
@@ -335,11 +336,11 @@ fn fake_transport_installs_and_uninstalls_generated_and_stock_stages() {
             }
         }
         assert!(matches!(
-            uninstall(&mut transport, &f.pin, &opts).unwrap(),
+            uninstall(&mut transport, slice::from_ref(&f.pin), &opts).unwrap(),
             InstallOutcome::Uninstalled { .. }
         ));
         f.assert_original(&blob);
-        uninstall(&mut transport, &f.pin, &opts).unwrap();
+        uninstall(&mut transport, slice::from_ref(&f.pin), &opts).unwrap();
         assert!(remote.join("receipt.json").exists());
         assert!(
             transport
@@ -360,11 +361,11 @@ fn dry_runs_and_missing_confirmation_execute_nothing() {
     opts.confirm_device_write = false;
     let mut transport = f.transport();
     assert!(matches!(
-        install(&mut transport, &stage, &f.pin, &opts),
+        install(&mut transport, &stage, slice::from_ref(&f.pin), &opts),
         Err(Error::DeviceWriteNotConfirmed)
     ));
     opts.dry_run = true;
-    let outcome = install(&mut transport, &stage, &f.pin, &opts).unwrap();
+    let outcome = install(&mut transport, &stage, slice::from_ref(&f.pin), &opts).unwrap();
     let InstallOutcome::DryRun { commands } = outcome else {
         panic!("expected dry run")
     };
@@ -385,15 +386,15 @@ fn dry_runs_and_missing_confirmation_execute_nothing() {
     f.assert_original("fake_drive");
     opts.dry_run = false;
     opts.confirm_device_write = true;
-    install(&mut transport, &stage, &f.pin, &opts).unwrap();
+    install(&mut transport, &stage, slice::from_ref(&f.pin), &opts).unwrap();
     let count = transport.runner().commands.len();
     opts.confirm_device_write = false;
     assert!(matches!(
-        uninstall(&mut transport, &f.pin, &opts),
+        uninstall(&mut transport, slice::from_ref(&f.pin), &opts),
         Err(Error::DeviceWriteNotConfirmed)
     ));
     opts.dry_run = true;
-    uninstall(&mut transport, &f.pin, &opts).unwrap();
+    uninstall(&mut transport, slice::from_ref(&f.pin), &opts).unwrap();
     assert_eq!(transport.runner().commands.len(), count);
     f.assert_installed(&stage);
 }
@@ -428,7 +429,7 @@ fn remote_hash_mismatch_aborts_before_first_live_rename() {
         root: &f.tree,
         done: false,
     };
-    assert!(install(&mut transport, &stage, &f.pin, &f.opts()).is_err());
+    assert!(install(&mut transport, &stage, slice::from_ref(&f.pin), &f.opts()).is_err());
     f.assert_original("fake_drive");
     assert!(f.opts().backup_directory.join("receipt.json").exists());
 }
@@ -446,7 +447,7 @@ fn firmware_and_serial_mismatch_refuse_all_writes() {
         write(&f.tree, &path, b"unknown firmware");
         let mut transport = f.transport();
         assert!(matches!(
-            install(&mut transport, &stage, &f.pin, &f.opts()),
+            install(&mut transport, &stage, slice::from_ref(&f.pin), &f.opts()),
             Err(Error::Firmware(_))
         ));
         assert!(!f.opts().backup_directory.exists());
@@ -457,16 +458,18 @@ fn firmware_and_serial_mismatch_refuse_all_writes() {
     let mut opts = f.opts();
     opts.expected_serial = "QC0000002".into();
     assert!(matches!(
-        install(&mut f.transport(), &stage, &f.pin, &opts),
+        install(&mut f.transport(), &stage, slice::from_ref(&f.pin), &opts),
         Err(Error::Changed(_))
     ));
     assert!(!opts.backup_directory.exists());
     let mut wrong_pin = f.pin.clone();
     wrong_pin.zenui_sha256 = sha256(b"different pin");
     assert!(matches!(
-        plan_install(&stage, &wrong_pin, &f.opts()),
+        plan_install(&stage, &[wrong_pin.clone()], &f.opts()),
         Err(Error::Firmware(_))
     ));
+    // A stage of one pinned build installs when another build is also pinned.
+    plan_install(&stage, &[wrong_pin, f.pin.clone()], &f.opts()).unwrap();
 }
 
 fn command_count(transport: &FakeTransport, ops: &[RemoteOperation]) -> usize {
@@ -481,13 +484,13 @@ fn partial_install_and_restore_failures_recover_from_retained_backups() {
     let stage = f.stage();
     let opts = f.opts();
     let mut transport = f.transport();
-    let plan = plan_install(&stage, &f.pin, &opts).unwrap();
+    let plan = plan_install(&stage, slice::from_ref(&f.pin), &opts).unwrap();
     let before_publish = command_count(&transport, &plan.preflight)
         + command_count(&transport, &plan.downloads)
         + command_count(&transport, &plan.prepare);
     transport.runner_mut().fail_at = Some(before_publish + 2);
     assert!(matches!(
-        install(&mut transport, &stage, &f.pin, &opts),
+        install(&mut transport, &stage, slice::from_ref(&f.pin), &opts),
         Err(Error::DevicePublish { .. })
     ));
     assert!(f.tree.join("blobs/core1/fake_drive_blob.bin").exists());
@@ -495,16 +498,16 @@ fn partial_install_and_restore_failures_recover_from_retained_backups() {
         fs::read(f.tree.join("ModelRepo.xml")).unwrap(),
         f.originals["ModelRepo.xml"]
     );
-    let plan = plan_uninstall(&f.pin, &opts).unwrap();
+    let plan = plan_uninstall(slice::from_ref(&f.pin), &opts).unwrap();
     let before_restore = transport.runner().commands.len()
         + command_count(&transport, &plan.preflight)
         + command_count(&transport, &plan.prepare);
     transport.runner_mut().fail_at = Some(before_restore + 5);
     assert!(matches!(
-        uninstall(&mut transport, &f.pin, &opts),
+        uninstall(&mut transport, slice::from_ref(&f.pin), &opts),
         Err(Error::DevicePublish { .. })
     ));
-    uninstall(&mut transport, &f.pin, &opts).unwrap();
+    uninstall(&mut transport, slice::from_ref(&f.pin), &opts).unwrap();
     f.assert_original("fake_drive");
 }
 
@@ -515,7 +518,7 @@ fn uninstall_refuses_concurrent_edits_permissions_and_corrupt_backups() {
         let stage = f.stage();
         let opts = f.opts();
         let mut transport = f.transport();
-        install(&mut transport, &stage, &f.pin, &opts).unwrap();
+        install(&mut transport, &stage, slice::from_ref(&f.pin), &opts).unwrap();
         match mutation {
             0 => {
                 fs::write(f.tree.join("ModelRepo.xml"), b"concurrent edit").unwrap();
@@ -547,7 +550,7 @@ fn uninstall_refuses_concurrent_edits_permissions_and_corrupt_backups() {
             }
         }
         let unchanged = fs::read(f.tree.join("blobs/moduleReport.xml")).unwrap();
-        assert!(uninstall(&mut transport, &f.pin, &opts).is_err());
+        assert!(uninstall(&mut transport, slice::from_ref(&f.pin), &opts).is_err());
         assert_eq!(
             fs::read(f.tree.join("blobs/moduleReport.xml")).unwrap(),
             unchanged
@@ -587,12 +590,12 @@ fn upload_chunks_are_bounded_and_partial_restore_temporary_can_be_retried() {
     assert!(uploads.iter().all(|c| c.stdin.len() <= 128 * 1024));
     let stage = f.stage();
     let opts = f.opts();
-    install(&mut transport, &stage, &f.pin, &opts).unwrap();
+    install(&mut transport, &stage, slice::from_ref(&f.pin), &opts).unwrap();
     write(
         &f.tree,
         ".qc-block-synthetic_test/restore/ModelRepo.xml",
         b"interrupted temporary copy",
     );
-    uninstall(&mut transport, &f.pin, &opts).unwrap();
+    uninstall(&mut transport, slice::from_ref(&f.pin), &opts).unwrap();
     f.assert_original("fake_drive");
 }

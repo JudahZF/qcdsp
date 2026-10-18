@@ -4,7 +4,7 @@ qcdsp is a Rust toolchain that makes custom DSP blocks for the Quad Cortex. You 
 
 qcdsp is part of [Tetrad](https://github.com/JudahZF/tetrad), an independent Rust user interface for the Quad Cortex. Tetrad includes this repository as a git submodule at `qcdsp/`.
 
-> **Warning.** This is an unofficial research tool. An install rewrites firmware data files on your Quad Cortex. A bad block can stop audio, crash the DSP cores or make a restore from backup necessary. Make a full SD-card backup before you install a block. You use this tool at your own risk. qcdsp supports only CorOS 4.1.0 and refuses other builds.
+> **Warning.** This is an unofficial research tool. An install rewrites firmware data files on your Quad Cortex. A bad block can stop audio, crash the DSP cores or make a restore from backup necessary. Make a full SD-card backup before you install a block. You use this tool at your own risk. qcdsp supports only CorOS 4.1.0 and 4.1.1 and refuses other builds.
 
 ## Crates
 
@@ -114,7 +114,7 @@ This repository does not include vendor keys, key locations, firmware, stock blo
 | --- | --- | --- |
 | Firmware copy | `--snapshot` | A local copy of `/opt/neuraldsp`. Do not use the live path. |
 | Serial | `--serial-file` | A copy of `/etc/qc_sn` |
-| Firmware pin | `--pin` | JSON with the SHA-256 of `ZenUI` and of the five `sharc_binaries` runtime files, made from a copy that you trust |
+| Kernel pin | `--pin` | JSON with the SHA-256 of your unit's two `ZPUKernel` files, made from a copy that you trust |
 | Key file | `--keys` | A private (mode 0600) file of hex lines in any order: the repo key, the blob key (16 bytes each) and the report seed |
 
 To find the **report seed** in your own ZenUI copy:
@@ -128,14 +128,13 @@ cat seed.hex >> path/to/keys    # keep both files at mode 0600
 
 The **repo key** and **blob key** are only in ZenUI's memory while it runs. qcdsp does not extract them. You must recover them yourself, for example with a short on-device memory scan. qcdsp checks each secret by decrypting a known file. It never prints a secret.
 
-The pin format:
+qcdsp knows the hashes of `ZenUI` and the three SOC2 `sharc_binaries` files of each supported build (`qc_deploy::KNOWN_BUILDS`). The CorOS installer translates the two `ZPUKernel` files per unit, so their hashes differ between units and you supply them. Both supported builds have the same kernels. The kernel pin format:
 
 ```json
-{ "zenui_sha256": "<hex>", "runtime_sha256": {
-    "ZPUKernel_Core1.ldr": "<hex>", "ZPUKernel_Core2.ldr": "<hex>",
-    "ZPU_SC589_SHARC_Core0.blwldr": "<hex>", "SOC2_SPL_Core0.blwldr": "<hex>",
-    "SOC2_SPL_Core0_Atma.blwldr": "<hex>" } }
+{ "ZPUKernel_Core1.ldr": "<hex>", "ZPUKernel_Core2.ldr": "<hex>" }
 ```
+
+Make it with `sha256sum sharc_binaries/ZPUKernel_Core{1,2}.ldr` in your copy. qcdsp checks your copy against each supported build. It refuses the copy if no build matches every file.
 
 ### Build, install and uninstall
 

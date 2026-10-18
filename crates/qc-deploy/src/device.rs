@@ -152,14 +152,14 @@ pub struct DeviceReceipt {
 }
 
 impl DeviceReceipt {
-    fn validate(&self, pin: &FirmwarePin, opts: &DeviceOptions) -> Result<()> {
+    fn validate(&self, pins: &[FirmwarePin], opts: &DeviceOptions) -> Result<()> {
         self.manifest.validate()?;
         if self.format != 1 || self.token != opts.token || self.serial != opts.expected_serial {
             return Err(Error::Invalid(
                 "backup token or device serial differs".into(),
             ));
         }
-        verify_pin(&self.manifest, pin)
+        verify_pin(&self.manifest, pins)
     }
 }
 
@@ -223,31 +223,31 @@ fn device_path(path: &str) -> String {
     format!("{ROOT}/{path}")
 }
 
-fn verify_pin(manifest: &DeviceManifest, pin: &FirmwarePin) -> Result<()> {
-    pin.validate()?;
-    if manifest.firmware != *pin {
-        return Err(Error::Firmware("stage and explicit pin differ".into()));
+/// The stage's firmware must be one of `pins`. Device checks then use the stage's pin.
+fn verify_pin(manifest: &DeviceManifest, pins: &[FirmwarePin]) -> Result<()> {
+    for pin in pins {
+        pin.validate()?;
+    }
+    if !pins.contains(&manifest.firmware) {
+        return Err(Error::Firmware(
+            "stage firmware is not a pinned build".into(),
+        ));
     }
     Ok(())
 }
 
 fn firmware_operations(pin: &FirmwarePin) -> Vec<RemoteOperation> {
-    std::iter::once(("ZenUI".into(), pin.zenui_sha256.clone()))
-        .chain(
-            pin.runtime_sha256
-                .iter()
-                .map(|(p, h)| (format!("sharc_binaries/{p}"), h.clone())),
-        )
+    pin.entries()
         .map(|(path, hash)| RemoteOperation::Check {
             path: device_path(&path),
-            hash: Some(hash),
+            hash: Some(hash.clone()),
             mode: None,
         })
         .collect()
 }
 
-fn preflight_operations(manifest: &DeviceManifest, pin: &FirmwarePin) -> Vec<RemoteOperation> {
-    let mut operations = firmware_operations(pin);
+fn preflight_operations(manifest: &DeviceManifest) -> Vec<RemoteOperation> {
+    let mut operations = firmware_operations(&manifest.firmware);
     operations.push(RemoteOperation::Read {
         path: "/etc/qc_sn".into(),
     });
@@ -305,10 +305,14 @@ fn run_preflight(
 pub fn preflight(
     transport: &mut impl Transport,
     stage: &DeviceStage,
-    pin: &FirmwarePin,
+    pins: &[FirmwarePin],
 ) -> Result<DeviceFacts> {
-    verify_pin(&stage.manifest, pin)?;
-    run_preflight(transport, &preflight_operations(&stage.manifest, pin), pin)
+    verify_pin(&stage.manifest, pins)?;
+    run_preflight(
+        transport,
+        &preflight_operations(&stage.manifest),
+        &stage.manifest.firmware,
+    )
 }
 
 fn checks(manifest: &DeviceManifest, after: bool) -> Vec<RemoteOperation> {
@@ -334,11 +338,11 @@ fn checks(manifest: &DeviceManifest, after: bool) -> Vec<RemoteOperation> {
 /// Pure local planning. It never calls a transport or writes anything.
 pub fn plan_install(
     stage: &DeviceStage,
-    pin: &FirmwarePin,
+    pins: &[FirmwarePin],
     opts: &DeviceOptions,
 ) -> Result<DevicePlan> {
     opts.validate()?;
-    verify_pin(&stage.manifest, pin)?;
+    verify_pin(&stage.manifest, pins)?;
     fs::separate(&stage.root, &opts.backup_directory)?;
     let receipt = DeviceReceipt {
         format: 1,
@@ -347,7 +351,7 @@ pub fn plan_install(
         manifest: stage.manifest.clone(),
     };
     let remote = remote_stage(&opts.token);
-    let mut preflight = preflight_operations(&stage.manifest, pin);
+    let mut preflight = preflight_operations(&stage.manifest);
     preflight.extend(checks(&stage.manifest, false));
     let mut downloads = Vec::new();
     let mut prepare = vec![RemoteOperation::CreateStage {
@@ -400,7 +404,7 @@ pub fn plan_install(
     });
     prepare.push(RemoteOperation::Sync);
     // Check the entire read set again after slow uploads and backup creation.
-    prepare.extend(firmware_operations(pin));
+    prepare.extend(firmware_operations(&stage.manifest.firmware));
     prepare.extend(checks(&stage.manifest, false));
     Ok(DevicePlan {
         preflight,
@@ -454,17 +458,17 @@ fn apply_remote(transport: &mut impl Transport, plan: &DevicePlan) -> Result<()>
 pub fn install(
     transport: &mut impl Transport,
     stage: &DeviceStage,
-    pin: &FirmwarePin,
+    pins: &[FirmwarePin],
     opts: &DeviceOptions,
 ) -> Result<InstallOutcome> {
-    let plan = plan_install(stage, pin, opts)?;
+    let plan = plan_install(stage, pins, opts)?;
     if opts.dry_run {
         return dry_run(transport, &plan);
     }
     if !opts.confirm_device_write {
         return Err(Error::DeviceWriteNotConfirmed);
     }
-    let facts = run_preflight(transport, &plan.preflight, pin)?;
+    let facts = run_preflight(transport, &plan.preflight, &plan.receipt.manifest.firmware)?;
     if facts.serial != opts.expected_serial {
         return Err(Error::Changed("device serial".into()));
     }
@@ -497,14 +501,14 @@ pub fn install(
 /// Reads and verifies only the LOCAL backup to construct a recovery plan. Both
 /// original and installed states are accepted, so partial install/restore can be
 /// retried. Unknown current contents or permissions are never overwritten.
-pub fn plan_uninstall(pin: &FirmwarePin, opts: &DeviceOptions) -> Result<DevicePlan> {
+pub fn plan_uninstall(pins: &[FirmwarePin], opts: &DeviceOptions) -> Result<DevicePlan> {
     opts.validate()?;
     let backup = fs::root(&opts.backup_directory)?;
     let receipt: DeviceReceipt = serde_json::from_slice(&fs::read(&backup, "receipt.json")?)?;
-    receipt.validate(pin, opts)?;
+    receipt.validate(pins, opts)?;
     verify_local_backup(&backup, &receipt)?;
     let remote = remote_stage(&receipt.token);
-    let preflight = preflight_operations(&receipt.manifest, pin);
+    let preflight = preflight_operations(&receipt.manifest);
     let mut prepare = vec![RemoteOperation::Check {
         path: format!("{remote}/receipt.json"),
         hash: Some(sha256(&serde_json::to_vec_pretty(&receipt)?)),
@@ -551,17 +555,17 @@ pub fn plan_uninstall(pin: &FirmwarePin, opts: &DeviceOptions) -> Result<DeviceP
 /// A changed file, serial, firmware or backup refuses before the first restore.
 pub fn uninstall(
     transport: &mut impl Transport,
-    pin: &FirmwarePin,
+    pins: &[FirmwarePin],
     opts: &DeviceOptions,
 ) -> Result<InstallOutcome> {
-    let plan = plan_uninstall(pin, opts)?;
+    let plan = plan_uninstall(pins, opts)?;
     if opts.dry_run {
         return dry_run(transport, &plan);
     }
     if !opts.confirm_device_write {
         return Err(Error::DeviceWriteNotConfirmed);
     }
-    let facts = run_preflight(transport, &plan.preflight, pin)?;
+    let facts = run_preflight(transport, &plan.preflight, &plan.receipt.manifest.firmware)?;
     if facts.serial != opts.expected_serial {
         return Err(Error::Changed("device serial".into()));
     }
