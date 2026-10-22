@@ -31,8 +31,9 @@ qcdsp does not depend on Tetrad. Tetrad's `tetrad-sharc` tests use the `qcdsp` c
 
 - All eight example blocks compile to installable stages. They run correctly on Tetrad's `tetrad-sharc` machine with PRM arithmetic.
 - The `Gain` example (model id 16901) loaded in a preset on a unit. It was then uninstalled to restore stock Cortex Control compatibility. Its audio output is not tested.
-- The other examples have not been installed on a unit.
-- CPU figures are estimates, not measurements: one cycle per instruction plus modelled DAG stalls, doubled in the catalogue entry.
+- The other examples have not been installed on a unit with `qc-deploy`.
+- Tetrad deploys generated blocks without a file install. On 2026-10-22 six of them played on a unit and matched the host reference, including an arena echo and two NAM models (docs/abi-status.md).
+- CPU figures are estimates, not measurements: one cycle per instruction plus modelled DAG stalls, doubled in the catalogue entry. On the unit, a NAM LSTM used about 1.4 times its modelled count.
 
 `docs/abi-status.md` lists the open items.
 
@@ -75,7 +76,7 @@ Rules:
 
 - `state(initial)` is one persistent sample value. `delay(samples)` is a delay line that starts at zero. Each one has a maximum of one update. A read gives the value from the previous sample. An update takes effect at the next sample.
 - Parameters use DSP units. On the unit, each parameter shows as a 0..1 control. qcdsp maps it to `[min, max]`.
-- On the unit, a block processes 32-sample blocks of two channels (a mono block computes one and copies it). Each computed channel has its own state and its own `io` descriptor pointer. The two buffers do not have to be adjacent. A state of 32 KB or less (delay lines up to approximately 4000 samples per channel) stays in the stock Volume allocation. A larger state goes into an arena that the block takes from the kernel's DM heap at start, up to the 153,592-byte heap (a stereo delay of approximately 19,000 samples per channel). The catalogue reports the arena, and ZenUI refuses a layout that does not fit. If the heap is full when the block starts, the block passes its input through unchanged. Arena blocks are tested only on Tetrad's machine, not on a unit.
+- On the unit, a block processes 32-sample blocks of two channels (a mono block computes one and copies it). Each computed channel has its own state and its own `io` descriptor pointer. The two buffers do not have to be adjacent. A state of 32 KB or less (delay lines up to approximately 4000 samples per channel) stays in the stock Volume allocation. A larger state goes into an arena that the block takes from the kernel's DM heap at start, up to the 153,592-byte heap (a stereo delay of approximately 19,000 samples per channel). The catalogue reports the arena, and ZenUI refuses a layout that does not fit. If the heap is full when the block starts, the block passes its input through unchanged. An arena block (a 9000-sample stereo echo) matched the host on a unit, and 100 redeploys left the heap unchanged; the full-heap path is tested only on Tetrad's machine.
 - An expression of only parameters and constants (for example a taper or a filter coefficient) is calculated once per 32-sample call, not once per sample.
 - The compiler loads values when they are first used. It writes each state when its new value is available. When the 14 data registers (15 without delays) are all in use, the compiler reloads or spills values to a per-channel slot in the block state. Spills count toward the per-channel state. Hoisted values are always in the 32 KB allocation.
 
