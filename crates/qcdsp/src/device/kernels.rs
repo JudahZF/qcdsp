@@ -6,8 +6,10 @@
 //! - I1 the convolution input, read with BDCST1 so both PEs get the same value; I2 the output;
 //!   I5 the elementwise input; I8 the weights (DAG2); I10 an elementwise operand through DAG2.
 //!   A ring buffer sets B and L of its index register, so post-modify and MODIFY wrap.
-//! - M0 tap jump, M1 next row, M2 output row stride, M3 = 2; M8 = 2, M9 weight rewind. The C
-//!   runtime keeps M5 = 0, M6 = 1.
+//! - I9 a fused condition (BDCST9), I11 the bias pairs.
+//! - Convolutions: M0-M4 step I1 (see [`conv`]), M2 the output row; M8 = 2, M9 the weight
+//!   rewind, M10 and M11 the condition and residual rows. Elementwise kernels: M3 = M8 = 2. The C
+//!   runtime keeps M5 = 0, M6 = 1, M13 = 0.
 //!
 //! Each kernel runs in SIMD (PEx and PEy) between `BIT SET MODE1` and `BIT CLR MODE1`, each
 //! followed by a NOP for the one-cycle effect latency. Every loop body is made of 48-bit
@@ -15,13 +17,13 @@
 
 use qc_asm::{
     AluOp, Compute, DataAccess, Direction, FloatMulAlu, Instruction, LoopCount, LoopMode,
-    MODE1_BDCST1, MODE1_PEYEN, MemoryAccess, ModifyRegister, UniversalRegister, Update,
-    VisaInstruction as V, VisaProgram,
+    MODE1_BDCST1, MODE1_BDCST9, MODE1_PEYEN, MemoryAccess, ModifyRegister, UniversalRegister,
+    Update, VisaInstruction as V, VisaProgram,
 };
 
 use super::{
     emit::{ARENA, SCRATCH_INDEX, STATE, i, m, r, ureg_i, ureg_m, ureg_r, word},
-    frame::FrameBuffer,
+    frame::{ConvKernel, FrameBuffer, Kernel},
     layout::{Layout, NetworkLayout},
     template::BLOCK_SAMPLES,
 };
@@ -32,11 +34,15 @@ const OUT: u8 = 2;
 const SRC: u8 = 5;
 const WEIGHTS: u8 = 8;
 const OPERAND: u8 = 10;
+/// A fused condition's input, read with BDCST9.
+const COND: u8 = 9;
+/// The bias pairs of a convolution.
+const BIAS: u8 = 11;
 /// Index registers whose B and L a kernel may set; process clears their L before it returns.
-pub(super) const RING_INDICES: [u8; 5] = [X, OUT, SCRATCH_INDEX, SRC, OPERAND];
+pub(super) const RING_INDICES: [u8; 6] = [X, OUT, SCRATCH_INDEX, SRC, COND, OPERAND];
 /// Preserved registers the network phase changes (process saves and restores them).
-pub(super) const NETWORK_SAVED: [u8; 3] = [SRC, WEIGHTS, OPERAND];
-pub(super) const NETWORK_SAVED_M: [u8; 6] = [0, 1, 2, 3, 8, 9];
+pub(super) const NETWORK_SAVED: [u8; 5] = [SRC, WEIGHTS, COND, OPERAND, BIAS];
+pub(super) const NETWORK_SAVED_M: [u8; 8] = [0, 1, 2, 3, 8, 9, 10, 11];
 
 fn ureg_b(index: u8) -> UniversalRegister {
     UniversalRegister::new(0x40 + index).expect("B register")
@@ -139,8 +145,7 @@ fn point(code: &mut VisaProgram, network: &NetworkLayout, index: u8, buffer: usi
     }
 }
 
-fn simd(code: &mut VisaProgram, on: bool, broadcast: bool) {
-    let mask = MODE1_PEYEN | if broadcast { MODE1_BDCST1 } else { 0 };
+fn simd(code: &mut VisaProgram, on: bool, mask: u32) {
     code.push(if on {
         V::BitSetMode1 { mask }
     } else {
@@ -185,31 +190,20 @@ pub(super) fn network_phase(
         code.push(one_access(None, store(0, OUT, 3)));
     });
 
-    for (at, op) in network.ops.iter().enumerate() {
+    let weights = layout
+        .weights()
+        .expect("a network block has weights")
+        .pointer;
+    for kernel in &net.plan.kernels {
+        let op = match kernel {
+            Kernel::Conv(conv_kernel) => {
+                looped += conv(code, network, net, conv_kernel, weights);
+                continue;
+            }
+            Kernel::Op(op) => &network.ops[*op],
+        };
         looped += match op {
-            Op::Conv {
-                input,
-                output,
-                kernel,
-                dilation,
-                accumulate,
-                ..
-            } => conv(
-                code,
-                net,
-                Conv {
-                    input: *input,
-                    output: *output,
-                    kernel: *kernel as u32,
-                    dilation: *dilation as u32,
-                    weights: net.plan.op_weights[at].expect("a convolution has weights"),
-                    accumulate: *accumulate,
-                },
-                layout
-                    .weights()
-                    .expect("a network block has weights")
-                    .pointer,
-            ),
+            Op::Conv { .. } => unreachable!("convolutions are convolution kernels"),
             Op::Add { input, output } => elementwise(code, net, *input, *output, Elementwise::Add),
             Op::Copy { input, output } => {
                 elementwise(code, net, *input, *output, Elementwise::Copy)
@@ -284,163 +278,273 @@ fn loop_cost(code: &mut VisaProgram, count: u32, body: impl FnOnce(&mut VisaProg
     length * (u64::from(count) - 1)
 }
 
-struct Conv {
-    input: usize,
-    output: usize,
-    kernel: u32,
-    dilation: u32,
-    /// Word offset of the packed weights in the weights arena.
-    weights: u32,
-    accumulate: bool,
-}
+/// A convolution kernel, two output channels and two rows at a time: PEx computes output `o`,
+/// PEy output `o + 1`; F12 sums row `t`, F13 row `t + 1`. Each weight pair (F0, through I8) is
+/// loaded once and multiplies the broadcast inputs of both rows (F4 and F5, through I1, which
+/// alternates between the rows). A fused condition is one more term (weight F1, inputs F6 and
+/// F7 through I9 with BDCST9); a residual (F10, F11 through I10) is added before the stores.
+/// Each add uses a product from two instructions before.
+fn conv(
+    code: &mut VisaProgram,
+    network: &Network,
+    net: &NetworkLayout,
+    kernel: &ConvKernel,
+    weights_pointer: u32,
+) -> u64 {
+    let Op::Conv {
+        input,
+        output,
+        kernel: taps,
+        dilation,
+        ..
+    } = &network.ops[kernel.op]
+    else {
+        unreachable!("a convolution kernel runs a convolution")
+    };
+    let (input_buffer, output_buffer) = (&net.plan.buffers[*input], &net.plan.buffers[*output]);
+    let (row_in, row_out) = (padded(input_buffer) as i32, padded(output_buffer) as i32);
+    let inputs = input_buffer.channels as usize;
+    let taps = *taps;
+    let n = inputs * taps;
+    let terms = kernel.terms(network);
+    let back = (taps as i32 - 1) * *dilation as i32;
 
-/// A convolution, two output channels at a time (PEx `o`, PEy `o + 1`). For each pair and each
-/// row: the bias pair, then `N = kernel × inputs` multiply-adds into two accumulators (F12 for
-/// even terms, F13 for odd terms, so an add uses a product from two instructions before), the
-/// sum, and a store of the pair.
-fn conv(code: &mut VisaProgram, net: &NetworkLayout, op: Conv, weights_pointer: u32) -> u64 {
-    let input = &net.plan.buffers[op.input];
-    let output = &net.plan.buffers[op.output];
-    let (row_in, row_out) = (padded(input) as i32, padded(output) as i32);
-    let inputs = input.channels as i32;
-    let (kernel, dilation) = (op.kernel as i32, op.dilation as i32);
-    let n = (kernel * inputs) as usize;
-
-    point(code, net, X, op.input);
-    let back = (kernel - 1) * dilation;
+    point(code, net, X, *input);
     if back > 0 {
         code.push(V::ModifyIndex {
             index: i(X),
             offset: -back * row_in,
         });
     }
-    point(code, net, OUT, op.output);
-    code.push(V::LoadDmOffset {
-        dst: ureg_i(WEIGHTS),
-        index: i(STATE),
-        offset: word(weights_pointer),
-    });
-    if op.weights > 0 {
-        code.push(V::ModifyIndex {
-            index: i(WEIGHTS),
-            offset: word(op.weights),
+    point(code, net, OUT, *output);
+    for (index, offset) in [(WEIGHTS, kernel.weights), (BIAS, kernel.bias)] {
+        code.push(V::LoadDmOffset {
+            dst: ureg_i(index),
+            index: i(STATE),
+            offset: word(weights_pointer),
         });
+        if offset > 0 {
+            code.push(V::ModifyIndex {
+                index: i(index),
+                offset: word(offset),
+            });
+        }
     }
-    // From the last input of a tap to the first input of the next tap (dilation rows on), and
-    // from the last input of the last tap to the first tap of the next row.
-    set(code, ureg_m(0), dilation * row_in - (inputs - 1));
+    let condition = kernel.condition.map(|buffer| {
+        point(code, net, COND, buffer);
+        set(code, ureg_m(10), padded(&net.plan.buffers[buffer]) as i32);
+        padded(&net.plan.buffers[buffer]) as i32
+    });
+    let residual = kernel.residual.map(|buffer| {
+        point(code, net, OPERAND, buffer);
+        set(code, ureg_m(11), padded(&net.plan.buffers[buffer]) as i32);
+        padded(&net.plan.buffers[buffer]) as i32
+    });
+    // I1 alternates rows: row t to row t + 1 (M0); from row t + 1 to the next term of row t:
+    // the next tap of the same input (M1), the first tap of the next input (M3), or, after the
+    // last term, the first term of row t + 2 (M4).
+    set(code, ureg_m(0), row_in);
+    set(code, ureg_m(1), *dilation as i32 * row_in - row_in);
+    set(code, ureg_m(3), 1 - back * row_in - row_in);
     set(
         code,
-        ureg_m(1),
-        row_in - (kernel - 1) * dilation * row_in - (inputs - 1),
+        ureg_m(4),
+        row_in - back * row_in - (inputs as i32 - 1),
     );
     set(code, ureg_m(2), row_out);
     set(code, ureg_m(8), 2);
-    set(code, ureg_m(9), -2 * n as i32);
-    simd(code, true, true);
-    let pairs = output.channels.div_ceil(2);
+    set(code, ureg_m(9), -2 * (terms as i32 - 1));
+    let mask = MODE1_PEYEN | MODE1_BDCST1 | if condition.is_some() { MODE1_BDCST9 } else { 0 };
+    simd(code, true, mask);
+    let pairs = output_buffer.channels.div_ceil(2);
     let mut inner = 0;
     let outer = loop_cost(code, pairs, |code| {
-        inner = loop_cost(code, BLOCK_SAMPLES, |code| {
-            mac_row(code, n, inputs as usize, kernel as usize, op.accumulate)
+        inner = loop_cost(code, BLOCK_SAMPLES / 2, |code| {
+            row_pair(code, n, taps, terms, residual.is_some())
         });
-        code.push(V::ModifyIndex {
-            index: i(X),
-            offset: -(BLOCK_SAMPLES as i32) * row_in,
-        });
-        code.push(V::ModifyIndex {
-            index: i(WEIGHTS),
-            offset: 2 * n as i32 + 2,
-        });
-        code.push(V::ModifyIndex {
-            index: i(OUT),
-            offset: -(BLOCK_SAMPLES as i32) * row_out + 2,
-        });
+        let rows = BLOCK_SAMPLES as i32;
+        let mut step = |index: u8, offset: i32| {
+            code.push(V::ModifyIndex {
+                index: i(index),
+                offset,
+            })
+        };
+        step(X, -rows * row_in);
+        step(WEIGHTS, 2 * terms as i32);
+        step(BIAS, 2);
+        step(OUT, -rows * row_out + 2);
+        if let Some(row) = condition {
+            step(COND, -rows * row);
+        }
+        if let Some(row) = residual {
+            step(OPERAND, -rows * row + 2);
+        }
     });
-    simd(code, false, true);
+    simd(code, false, mask);
     outer + inner * u64::from(pairs)
 }
 
-/// One row of a convolution pair (see [`conv`]). Term `j` multiplies the weight pair `w_j`
-/// (F0/F1, loaded one instruction after its input) by the broadcast input `x_j` (F4/F5) into
-/// F8/F9; the add of term `j` runs two instructions after its product.
-fn mac_row(code: &mut VisaProgram, n: usize, inputs: usize, kernel: usize, accumulate: bool) {
-    // Input modifiers: +1 within a tap, M0 to the next tap, M1 to the next row.
-    let x_modifier = |j: usize| {
+/// One instruction of a row pair: its compute, DM access and PM access.
+#[derive(Default)]
+struct Slot {
+    compute: Option<Compute>,
+    dm: Option<DataAccess>,
+    pm: Option<DataAccess>,
+}
+
+/// Rows `t` and `t + 1` of one output pair (see [`conv`]): load the first inputs, weight and
+/// biases; for each term an instruction for row `t` and one for row `t + 1`; the last adds,
+/// the residuals and the stores. Loads that the steady state has no slot for (the condition's
+/// weight and inputs, the residuals) take a free PM slot before they are needed, or an
+/// instruction of their own.
+fn row_pair(code: &mut VisaProgram, n: usize, taps: usize, terms: usize, residual: bool) {
+    // The modifier of term `j`'s row t + 1 load, which moves I1 to term `j + 1` of row t.
+    let after_b = |j: usize| {
         if j == n - 1 {
-            1
-        } else if (j + 1) % inputs == 0 {
-            0
+            4
+        } else if (j + 1) % taps == 0 {
+            3
         } else {
-            6
+            1
         }
     };
-    debug_assert_eq!(n, kernel * inputs);
-    for step in 0..n + 4 {
-        let dm = if step < n {
-            Some(load(4 + (step % 2) as u8, X, x_modifier(step)))
-        } else if accumulate && step == n {
-            Some(load(14, OUT, 5))
+    // Weight stream: w_0 .. w_{n-1}, then the condition's; the last load rewinds (M9).
+    let w_modifier = |j: usize| if j == terms - 1 { 9 } else { 8 };
+    let mac = |row: u8, j: usize| {
+        let (weight, input) = if j < n { (0, 4 + row) } else { (1, 6 + row) };
+        (8 + row, weight, input)
+    };
+    let mut slots: Vec<Slot> = Vec::new();
+    slots.push(Slot {
+        dm: Some(load(4, X, 0)),
+        pm: Some(load(0, WEIGHTS, w_modifier(0))),
+        ..Slot::default()
+    });
+    slots.push(Slot {
+        dm: Some(load(5, X, after_b(0))),
+        pm: Some(load(12, BIAS, 13)),
+        ..Slot::default()
+    });
+    let compute = |row: u8, j: usize| {
+        let (product, weight, input) = mac(row, j);
+        if j == 0 {
+            return single(Instruction::FloatMul {
+                dst: r(product),
+                lhs: r(weight),
+                rhs: r(input),
+            });
+        }
+        Compute::float_mul_alu(FloatMulAlu {
+            product: r(product),
+            mul_x: r(weight),
+            mul_y: r(input),
+            op: AluOp::Add,
+            alu_dst: r(12 + row),
+            alu_x: r(8 + row),
+            alu_y: r(12 + row),
+        })
+        .expect("register groups of a multiply-add")
+    };
+    // Slot indices of the term instructions, for the load deadlines below.
+    let first_term = slots.len();
+    for j in 0..terms {
+        slots.push(Slot {
+            compute: Some(compute(0, j)),
+            dm: (j + 1 < n).then(|| load(4, X, 0)),
+            pm: (j == 0).then(|| load(13, BIAS, 13)),
+        });
+        slots.push(Slot {
+            compute: Some(compute(1, j)),
+            dm: (j + 1 < n).then(|| load(5, X, after_b(j + 1))),
+            pm: (j + 1 < n).then(|| load(0, WEIGHTS, w_modifier(j + 1))),
+        });
+    }
+    let add = |row: u8, lhs: u8| {
+        Some(single(Instruction::FloatAdd {
+            dst: r(12 + row),
+            lhs: r(lhs),
+            rhs: r(12 + row),
+        }))
+    };
+    let tail = slots.len();
+    slots.push(Slot {
+        compute: add(0, 8),
+        ..Slot::default()
+    });
+    slots.push(Slot {
+        compute: add(1, 9),
+        dm: (!residual).then(|| store(12, OUT, 2)),
+        ..Slot::default()
+    });
+    if residual {
+        slots.push(Slot {
+            compute: add(0, 10),
+            ..Slot::default()
+        });
+        slots.push(Slot {
+            compute: add(1, 11),
+            dm: Some(store(12, OUT, 2)),
+            ..Slot::default()
+        });
+    }
+    slots.push(Slot {
+        dm: Some(store(13, OUT, 2)),
+        ..Slot::default()
+    });
+
+    // (load, earliest slot, the slot that uses it). The condition term is term n.
+    let mut extras: Vec<(DataAccess, usize, usize)> = Vec::new();
+    if terms > n {
+        // The condition weight follows w_{n-1} in the stream: after the slot that loads it.
+        let last_weight = if n == 1 {
+            0
         } else {
-            None
+            first_term + 2 * (n - 2) + 1
         };
-        let pm = match step {
-            0 => Some(load(12, WEIGHTS, 8)),
-            s if s <= n => {
-                let j = s - 1;
-                Some(load((j % 2) as u8, WEIGHTS, if j == n - 1 { 9 } else { 8 }))
+        let row_t = first_term + 2 * n;
+        extras.push((load(1, WEIGHTS, w_modifier(n)), last_weight + 1, row_t));
+        extras.push((load(6, COND, 10), 0, row_t));
+        extras.push((load(7, COND, 10), 0, row_t + 1));
+    }
+    if residual {
+        extras.push((load(10, OPERAND, 11), 0, tail + 2));
+        extras.push((load(11, OPERAND, 11), 0, tail + 3));
+    }
+    // Place each in the first free PM slot in its window, after the previous load of the same
+    // pointer; else in an instruction of its own just before its user.
+    let mut previous: Option<(u8, usize)> = None;
+    let mut inserted = 0;
+    for (access, earliest, user) in extras {
+        let (earliest, user) = (earliest + inserted, user + inserted);
+        let after = match previous {
+            Some((index, at)) if index == access.index.index() => at + 1,
+            _ => 0,
+        };
+        let start = earliest.max(after);
+        let at = match (start..user).find(|&at| slots[at].pm.is_none()) {
+            Some(at) => {
+                slots[at].pm = Some(access);
+                at
             }
-            _ => None,
+            None => {
+                slots.insert(
+                    user,
+                    Slot {
+                        pm: Some(access),
+                        ..Slot::default()
+                    },
+                );
+                inserted += 1;
+                user
+            }
         };
-        let product = (2..n + 2).contains(&step).then(|| step - 2);
-        let sum = (4..n + 4).contains(&step).then(|| step - 4);
-        let compute = match (product, sum) {
-            (Some(j), Some(k)) => Some(
-                Compute::float_mul_alu(FloatMulAlu {
-                    product: r(8 + (j % 2) as u8),
-                    mul_x: r((j % 2) as u8),
-                    mul_y: r(4 + (j % 2) as u8),
-                    op: AluOp::Add,
-                    alu_dst: r(12 + (k % 2) as u8),
-                    alu_x: r(8 + (k % 2) as u8),
-                    alu_y: r(12 + (k % 2) as u8),
-                })
-                .expect("register groups of a multiply-add"),
-            ),
-            (Some(j), None) => Some(single(Instruction::FloatMul {
-                dst: r(8 + (j % 2) as u8),
-                lhs: r((j % 2) as u8),
-                rhs: r(4 + (j % 2) as u8),
-            })),
-            (None, Some(k)) => Some(single(Instruction::FloatAdd {
-                dst: r(12 + (k % 2) as u8),
-                lhs: r(8 + (k % 2) as u8),
-                rhs: r(12 + (k % 2) as u8),
-            })),
-            (None, None) if step == 0 => Some(single(Instruction::IntegerSub {
-                dst: r(13),
-                lhs: r(13),
-                rhs: r(13),
-            })),
-            (None, None) => None,
-        };
-        if let Some(instruction) = instruction(compute, dm, pm) {
+        previous = Some((access.index.index(), at));
+    }
+    for slot in slots {
+        if let Some(instruction) = instruction(slot.compute, slot.dm, slot.pm) {
             code.push(instruction);
         }
     }
-    code.push(V::Compute(single(Instruction::FloatAdd {
-        dst: r(12),
-        lhs: r(12),
-        rhs: r(13),
-    })));
-    if accumulate {
-        code.push(V::Compute(single(Instruction::FloatAdd {
-            dst: r(12),
-            lhs: r(12),
-            rhs: r(14),
-        })));
-    }
-    code.push(one_access(None, store(12, OUT, 2)));
 }
 
 #[derive(Clone, Copy)]
@@ -471,7 +575,7 @@ fn elementwise(
         set(code, ureg_m(8), 2);
     }
     set(code, ureg_m(3), 2);
-    simd(code, true, false);
+    simd(code, true, MODE1_PEYEN);
     if let Elementwise::Activation(function) = kind {
         constants(code, function);
     }
@@ -509,7 +613,7 @@ fn elementwise(
             code.push(one_access(None, store(0, OUT, 3)));
         }
     });
-    simd(code, false, false);
+    simd(code, false, MODE1_PEYEN);
     looped
 }
 
@@ -572,6 +676,8 @@ fn activation(code: &mut VisaProgram, function: Activation) {
                 lhs: r(lhs),
                 rhs: r(rhs),
             };
+            // The numerator and denominator Horner chains are independent, so their steps
+            // alternate: each result is used two instructions later, not in the next one.
             let mut ops = vec![
                 FloatMax {
                     dst: r(0),
@@ -584,20 +690,18 @@ fn activation(code: &mut VisaProgram, function: Activation) {
                     rhs: r(7),
                 },
                 mul(1, 0, 0),
-                // numerator: 378 + x², then two Horner steps, then × x.
-                add(2, 1, 8),
+                mul(3, 1, 11), // 28 x²
+                add(2, 1, 8),  // 378 + x²
+                add(3, 3, 12), // + 3150
                 mul(2, 1, 2),
-                add(2, 2, 9),
+                mul(3, 1, 3),
+                add(2, 2, 9),  // + 17325
+                add(3, 3, 13), // + 62370
                 mul(2, 1, 2),
-                add(2, 2, 10),
-                mul(2, 0, 2),
-                // denominator: 3150 + 28 x², then two Horner steps.
-                mul(3, 1, 11),
-                add(3, 3, 12),
                 mul(3, 1, 3),
-                add(3, 3, 13),
-                mul(3, 1, 3),
-                add(3, 3, 10),
+                add(2, 2, 10), // + 135135
+                add(3, 3, 10), // + 135135
+                mul(2, 0, 2),  // × x
                 IntegerSub {
                     dst: r(4),
                     lhs: r(14),

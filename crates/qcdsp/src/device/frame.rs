@@ -15,8 +15,12 @@
 //!
 //! A convolution computes two output channels per instruction in SIMD: PEx output `o`, PEy
 //! output `o + 1`. Both read the same input value (I1 broadcast) and adjacent weights, so the
-//! weights of an output pair are interleaved. An odd last output channel runs alone, with zero
-//! weights for its missing partner.
+//! weights of an output pair are interleaved. An odd last output channel gets zero weights for
+//! its missing partner (rows have an even word count, so its column exists).
+//!
+//! Some operations fuse into the convolution before them ([`Kernel::Conv`]): a one-channel
+//! `accumulate` 1×1 convolution into the same output (the NAM input mixin) becomes one more
+//! term, and an `add` into the output is added before the store. The sums keep the host's order.
 
 use super::template::BLOCK_SAMPLES;
 use crate::network::{Network, Op};
@@ -53,10 +57,10 @@ pub struct FramePlan {
     pub buffers: Vec<FrameBuffer>,
     /// Words of the DM arena.
     pub dm_words: u32,
-    /// The PM arena, in the order the kernels read it.
+    /// The PM arena: weight pairs and bias pairs of every convolution kernel.
     pub weights: Vec<f32>,
-    /// Word offset of each operation's weights in `weights` (convolutions only).
-    pub op_weights: Vec<Option<u32>>,
+    /// The kernels in program order; together they run every operation once.
+    pub kernels: Vec<Kernel>,
     /// Buffers with a ring, in buffer order; each has a cursor word in the state.
     pub rings: Vec<usize>,
 }
@@ -101,38 +105,13 @@ impl FramePlan {
             })
             .collect();
         let mut weights = Vec::new();
-        let op_weights = network
-            .ops
-            .iter()
-            .map(|op| match op {
-                Op::Conv {
-                    input,
-                    output,
-                    kernel,
-                    weights: w,
-                    bias,
-                    ..
-                } => {
-                    let at = weights.len() as u32;
-                    pack(
-                        &mut weights,
-                        network.buffers[*input],
-                        network.buffers[*output],
-                        *kernel,
-                        w,
-                        bias.as_deref(),
-                    );
-                    Some(at)
-                }
-                _ => None,
-            })
-            .collect();
+        let kernels = kernels(network, &mut weights);
         Self {
             rings: (0..history.len()).filter(|&b| history[b] > 0).collect(),
             buffers,
             dm_words: offset,
             weights,
-            op_weights,
+            kernels,
         }
     }
 
@@ -166,33 +145,122 @@ fn live_ranges(network: &Network) -> Vec<(usize, usize)> {
     live
 }
 
-/// Appends one convolution's weights in kernel order: for each output pair `(o, o + 1)`, the
-/// bias pair, then for each tap `k` and input `i` the pair `w[o][i][k], w[o + 1][i][k]`. A
-/// missing partner (odd output count) and a missing bias are zero.
-fn pack(
-    out: &mut Vec<f32>,
-    inputs: usize,
-    outputs: usize,
-    kernel: usize,
-    weights: &[f32],
-    bias: Option<&[f32]>,
-) {
-    let weight = |o: usize, i: usize, k: usize| {
-        if o < outputs {
-            weights[(o * inputs + i) * kernel + k]
+/// What the code generator runs.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Kernel {
+    Conv(ConvKernel),
+    /// An operation that runs alone (elementwise).
+    Op(usize),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ConvKernel {
+    /// The convolution.
+    pub op: usize,
+    /// A fused one-channel `accumulate` 1×1 convolution into the same output: its input
+    /// buffer. Its weights follow the convolution's in each output pair.
+    pub condition: Option<usize>,
+    /// Added to the sum before the store: the output itself (`accumulate`) or the input of a
+    /// fused `add`.
+    pub residual: Option<usize>,
+    /// Word offsets in [`FramePlan::weights`] of the weight pairs and of the bias pairs.
+    pub weights: u32,
+    pub bias: u32,
+}
+
+impl ConvKernel {
+    /// Multiply-adds of one output: the convolution's terms, plus one for the condition.
+    pub fn terms(&self, network: &Network) -> usize {
+        let Op::Conv { input, kernel, .. } = &network.ops[self.op] else {
+            unreachable!("a convolution kernel runs a convolution")
+        };
+        network.buffers[*input] * kernel + usize::from(self.condition.is_some())
+    }
+}
+
+/// Groups the operations into kernels and packs their weights.
+fn kernels(network: &Network, packed: &mut Vec<f32>) -> Vec<Kernel> {
+    let ops = &network.ops;
+    let mut kernels = Vec::new();
+    let mut at = 0;
+    while at < ops.len() {
+        let Op::Conv {
+            input,
+            output,
+            kernel,
+            weights,
+            bias,
+            accumulate,
+            ..
+        } = &ops[at]
+        else {
+            kernels.push(Kernel::Op(at));
+            at += 1;
+            continue;
+        };
+        let mut next = at + 1;
+        let condition = match ops.get(next) {
+            Some(Op::Conv {
+                input: c,
+                output: o,
+                kernel: 1,
+                weights: w,
+                bias: None,
+                accumulate: true,
+                ..
+            }) if o == output && c != output && network.buffers[*c] == 1 => {
+                next += 1;
+                Some((*c, w.as_slice()))
+            }
+            _ => None,
+        };
+        let residual = if *accumulate {
+            Some(*output)
         } else {
-            0.0
-        }
-    };
-    let bias = |o: usize| bias.filter(|_| o < outputs).map_or(0.0, |b| b[o]);
-    for o in (0..outputs).step_by(2) {
-        out.extend([bias(o), bias(o + 1)]);
-        for k in 0..kernel {
+            match ops.get(next) {
+                Some(Op::Add {
+                    input: r,
+                    output: o,
+                }) if o == output => {
+                    next += 1;
+                    Some(*r)
+                }
+                _ => None,
+            }
+        };
+        let (inputs, outputs) = (network.buffers[*input], network.buffers[*output]);
+        let weight_at = packed.len() as u32;
+        // Per output pair: the terms in the host's order (input, then tap), then the condition.
+        for o in (0..outputs).step_by(2) {
+            let pair = |value: &dyn Fn(usize) -> f32| {
+                [o, o + 1].map(|o| if o < outputs { value(o) } else { 0.0 })
+            };
             for i in 0..inputs {
-                out.extend([weight(o, i, k), weight(o + 1, i, k)]);
+                for k in 0..*kernel {
+                    packed.extend(pair(&|o| weights[(o * inputs + i) * kernel + k]));
+                }
+            }
+            if let Some((_, w)) = condition {
+                packed.extend(pair(&|o| w[o]));
             }
         }
+        let bias_at = packed.len() as u32;
+        for o in (0..outputs).step_by(2) {
+            packed.extend([o, o + 1].map(|o| match bias {
+                Some(b) if o < outputs => b[o],
+                _ => 0.0,
+            }));
+        }
+        kernels.push(Kernel::Conv(ConvKernel {
+            op: at,
+            condition: condition.map(|(c, _)| c),
+            residual,
+            weights: weight_at,
+            bias: bias_at,
+        }));
+        at = next;
     }
+    kernels
 }
 
 #[cfg(test)]
@@ -235,16 +303,21 @@ mod tests {
         assert_eq!((b.offset, b.words()), (0, 64));
         assert_eq!(plan.dm_words, 64 + 148);
 
-        assert_eq!(plan.op_weights, [Some(0), Some(8)]);
+        let [Kernel::Conv(first), Kernel::Conv(second)] = &plan.kernels[..] else {
+            panic!("two convolution kernels: {:?}", plan.kernels)
+        };
+        assert_eq!(
+            (first.weights, first.bias, second.weights, second.bias),
+            (0, 4, 8, 20)
+        );
         #[rustfmt::skip]
         assert_eq!(plan.weights, [
-            // first conv: pair (0, 1), then (2, -)
-            0.1, 0.2, 1.0, 2.0,
-            0.3, 0.0, 3.0, 0.0,
-            // second conv: one output (0, -), bias zero; k = 0 then k = 1, inputs 0..3
+            // first conv: pairs (0, 1) and (2, -), then their biases
+            1.0, 2.0, 3.0, 0.0,
+            0.1, 0.2, 0.3, 0.0,
+            // second conv: one output (0, -); input 0 taps 0 and 1, input 1, input 2; no bias
+            4.0, 0.0, 5.0, 0.0, 6.0, 0.0, 7.0, 0.0, 8.0, 0.0, 9.0, 0.0,
             0.0, 0.0,
-            4.0, 0.0, 6.0, 0.0, 8.0, 0.0,
-            5.0, 0.0, 7.0, 0.0, 9.0, 0.0,
         ][..]);
     }
 }
