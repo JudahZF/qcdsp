@@ -70,7 +70,7 @@ impl Channels {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Parameter {
     pub name: String,
@@ -139,7 +139,7 @@ impl Delay {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum BinaryOp {
     Add,
@@ -154,7 +154,7 @@ pub(crate) enum BinaryOp {
     Div,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum Node {
     Input,
@@ -310,7 +310,7 @@ impl Expander {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Memory<T> {
     pub initial: T,
@@ -320,7 +320,7 @@ pub(crate) struct Memory<T> {
 /// A validated, topologically ordered per-sample graph. Every state and delay
 /// read sees the previous sample; updates take effect for the next sample.
 /// Delay lengths are measured in samples.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Block {
     pub(crate) version: u32,
@@ -365,6 +365,21 @@ impl Block {
     }
     pub fn version(&self) -> u32 {
         self.version
+    }
+
+    /// The same graph under another identity. A host that installs blocks from many
+    /// sources gives each one a unique blob name and its own display name.
+    pub fn renamed(
+        mut self,
+        blob_name: impl Into<String>,
+        name: impl Into<String>,
+        category: Category,
+    ) -> Result<Self> {
+        self.blob_name = blob_name.into();
+        self.name = name.into();
+        self.category = category;
+        self.validate()?;
+        Ok(self)
     }
 
     /// The same block with every macro node (`div`, `recip`, `tanh`, `sigmoid`)
