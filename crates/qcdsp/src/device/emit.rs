@@ -13,7 +13,9 @@
 //! With an arena ([`Layout::arena`]) init takes the bank memory from the kernel heap with the
 //! stock C call ([`kernel_call`]); every callback reads the arena pointer from the state and
 //! does nothing to the banks when it is 0 (the allocation failed), so process leaves the audio
-//! dry. Without an arena the code has no kernel calls and no relocations.
+//! dry. This is a backstop only: on a unit the kernel did not return 0 for a request larger than
+//! heap 0 (docs/abi-status.md, P6), so the exact heap figures and the fit are the guard. Without
+//! an arena the code has no kernel calls and no relocations.
 //!
 //! Every memory access is an unqualified normal-word access with word offsets,
 //! so code is correct whether a pointer is byte- or normal-word-addressed.
@@ -28,10 +30,9 @@ use qc_format::blob::{CodeRelocation, Section};
 use qc_link::{KernelForm, KernelRef};
 
 use super::{
-    layout::{Arena, Layout},
+    layout::{Arena, Heap, Layout},
     template::{
-        ARENA_HEAP, BLOCK_SAMPLES, Entries, HEAP_FREE, HEAP_MALLOC, STOCK_DESTROY, STOCK_INIT,
-        STOCK_PARCELS,
+        BLOCK_SAMPLES, Entries, HEAP_FREE, HEAP_MALLOC, STOCK_DESTROY, STOCK_INIT, STOCK_PARCELS,
     },
 };
 use crate::{
@@ -171,10 +172,16 @@ fn kernel_call(code: &mut VisaProgram, start: u32, target: u32, links: &mut Link
     Ok(())
 }
 
-/// `kernel_call` with R4 = `heap` and the state kept in a frame word (R4 is scratch).
+/// `kernel_call` with R4 = the arena's heap and the state kept in a frame word (R4 is scratch).
 /// The caller entered with a stock C call, so I7 = I6 − 2: one word is reserved below it and
 /// released before the routine tail-jumps to stock code, which expects that frame.
-fn heap_call(code: &mut VisaProgram, start: u32, target: u32, links: &mut Links) -> Result<()> {
+fn heap_call(
+    code: &mut VisaProgram,
+    start: u32,
+    target: u32,
+    arena: Arena,
+    links: &mut Links,
+) -> Result<()> {
     code.push(V::ModifyIndex {
         index: i(STACK),
         offset: -1,
@@ -186,7 +193,7 @@ fn heap_call(code: &mut VisaProgram, start: u32, target: u32, links: &mut Links)
     });
     code.push(V::LoadImmediate {
         dst: ureg_r(4),
-        value: ARENA_HEAP,
+        value: arena.heap as u32,
     });
     kernel_call(code, start, target, links)?;
     code.push(V::LoadDmOffset {
@@ -255,7 +262,7 @@ fn init(block: &Block, layout: &Layout, start: u32, links: &mut Links) -> Result
                 dst: ureg_r(8),
                 value: arena.bytes(),
             });
-            heap_call(&mut code, start, HEAP_MALLOC, links)?;
+            heap_call(&mut code, start, HEAP_MALLOC, arena, links)?;
             code.push(V::Transfer {
                 dst: ureg_i(SCRATCH_INDEX),
                 src: ureg_r(4),
@@ -314,7 +321,7 @@ fn destroy(arena: Arena, start: u32, links: &mut Links) -> Result<Vec<u16>> {
     let mut code = VisaProgram::new();
     load_arena(&mut code, arena);
     code.jump(Condition::Eq, "stock");
-    heap_call(&mut code, start, HEAP_FREE, links)?;
+    heap_call(&mut code, start, HEAP_FREE, arena, links)?;
     code.label("stock");
     tail_jump(&mut code, start, STOCK_DESTROY)?;
     Ok(code.parcels()?)
@@ -411,6 +418,31 @@ fn delay_slot(code: &mut VisaProgram, layout: &Layout, bank: u32, index: usize) 
         index: i(DELAY),
         offset: word(bank + buffer) - 1,
     });
+}
+
+/// Extra cycles of one load or store in the SD heap (DDR) over L1. Measured on a unit
+/// (2026-10-22): 8 delay lines with their banks in the SD heap took 16 % more of a core than
+/// the same block in L1, about 37 cycles for each of its 1280 bank accesses per call.
+const SD_ACCESS_CYCLES: u64 = 40;
+
+/// Bank words a sample step reads or writes: a delay tap loads its cursor and a sample; a
+/// delay write loads the cursor, stores the sample and stores the cursor back.
+fn bank_accesses(step: Step) -> u64 {
+    match step {
+        Step::Load {
+            source: InputSource::Delay { .. },
+            ..
+        } => 2,
+        Step::StoreDelay { .. } => 3,
+        Step::Load {
+            source: InputSource::State { .. },
+            ..
+        }
+        | Step::StoreState { .. }
+        | Step::Spill { .. }
+        | Step::Reload { .. } => 1,
+        _ => 0,
+    }
 }
 
 /// Emit one kernel step. `bank` is the channel bank (None in the control
@@ -602,14 +634,20 @@ fn process(layout: &Layout, kernel: &Kernel) -> Result<(Vec<u16>, u64)> {
         code.label(&top);
         let before = code.instruction_count();
         let mut delay_setups = 0;
+        let mut accesses = 0;
         for &sample in &contract.sample {
             delay_setups += step(&mut code, kernel, layout, Some((channel, bank)), sample);
+            accesses += bank_accesses(sample);
         }
         // One cycle per instruction, plus the SHARC+ DAG load-to-use stalls (4 cycles) of each
-        // delay pointer setup. The catalogue entry doubles the result (`metadata::CPU_SAFETY`)
-        // until a measurement on the unit replaces this model.
+        // delay pointer setup, plus the DDR latency of each bank access when the banks are in
+        // the SD heap. The catalogue entry doubles the result (`metadata::CPU_SAFETY`).
         let instructions = (code.instruction_count() - before) as u64;
-        per_sample = per_sample.max(instructions + 4 * delay_setups + 2);
+        let sd = match layout.arena {
+            Some(Arena { heap: Heap::Sd, .. }) => SD_ACCESS_CYCLES * accesses,
+            _ => 0,
+        };
+        per_sample = per_sample.max(instructions + 4 * delay_setups + 2 + sd);
         code.push(V::IntegerSubOne {
             dst: r(COUNTER),
             src: r(COUNTER),

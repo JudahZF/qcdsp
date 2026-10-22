@@ -47,7 +47,7 @@ enum Command {
         /// Unused ModelRepo id for the new block.
         #[arg(long)]
         model_id: u32,
-        /// Display name; defaults to "<block name> (qcdsp)".
+        /// Display name; defaults to the block name followed by " (qcdsp)".
         #[arg(long)]
         name: Option<String>,
         #[arg(short, long)]

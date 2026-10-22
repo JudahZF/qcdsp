@@ -16,7 +16,7 @@ use qc_format::{
 };
 
 pub use emit::Generated;
-pub use layout::{Arena, Layout};
+pub use layout::{Arena, Heap, Layout};
 pub use metadata::{Resources, model_element, module_element};
 pub use qc_link::KernelMap;
 pub use template::{Entries, VolumeTemplate};

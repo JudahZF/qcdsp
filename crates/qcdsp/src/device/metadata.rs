@@ -3,8 +3,8 @@
 use qc_format::metadata::escape;
 
 use super::{
-    layout::Arena,
-    template::{DM_HEAP_BYTES, STOCK_CPU, STOCK_DM_HEAP, STOCK_STATE_BYTES},
+    layout::{Arena, Heap},
+    template::{DM_HEAP_BYTES, SD_HEAP_BYTES, STOCK_CPU, STOCK_DM_HEAP, STOCK_STATE_BYTES},
 };
 use crate::{Block, Error, Result};
 
@@ -24,23 +24,29 @@ pub struct Resources {
 }
 
 impl Resources {
-    /// The DM heap the kernel charges: Volume's own figure with its state allocation replaced
-    /// by the generated one, plus the block's heap-0 arena. `heap_malloc` (k1 `0x16adfa`)
-    /// takes `(bytes + 11) & !7` per allocation (an 8-byte header, rounded to 8 bytes).
     pub fn dm_heap(&self, arena: Option<Arena>) -> u32 {
-        STOCK_DM_HEAP - heap_charge(STOCK_STATE_BYTES)
-            + heap_charge(self.state_bytes)
-            + arena.map_or(0, |arena| heap_charge(arena.bytes()))
+        dm_heap(self.state_bytes, arena)
     }
 
-    /// Refuses a block whose DM heap figure exceeds heap 0 itself: no layout could place it.
-    /// Smaller figures are for ZenUI's fit (with every other block on the core) to decide.
+    /// The SD heap the kernel charges: the block's SD arena, if it has one.
+    pub fn sd_heap(&self, arena: Option<Arena>) -> u32 {
+        arena
+            .filter(|arena| arena.heap == Heap::Sd)
+            .map_or(0, |arena| heap_charge(arena.bytes()))
+    }
+
+    /// Refuses a block whose heap figures exceed the heaps themselves: no layout could place
+    /// it. Smaller figures are for ZenUI's fit (with every other block on the core) to decide.
     pub fn check_heaps(&self, arena: Option<Arena>) -> Result<()> {
-        let heap = self.dm_heap(arena);
-        if heap > DM_HEAP_BYTES {
-            return Err(Error::Invalid(format!(
-                "the block needs {heap} bytes of DM heap; heap 0 has {DM_HEAP_BYTES}"
-            )));
+        for (name, heap, length) in [
+            ("DM", self.dm_heap(arena), DM_HEAP_BYTES),
+            ("SD", self.sd_heap(arena), SD_HEAP_BYTES),
+        ] {
+            if heap > length {
+                return Err(Error::Invalid(format!(
+                    "the block needs {heap} bytes of {name} heap; the heap has {length}"
+                )));
+            }
         }
         Ok(())
     }
@@ -49,6 +55,17 @@ impl Resources {
         let generated = self.cycles_per_call as f64 / CYCLES_PER_BLOCK * 100.0 * CPU_SAFETY;
         ((STOCK_CPU + generated) * 1000.0).ceil() / 1000.0
     }
+}
+
+/// The DM heap the kernel charges: Volume's own figure with its state allocation replaced by
+/// the generated one, plus the block's arena when it is in heap 0. `heap_malloc` (k1
+/// `0x16adfa`) takes `(bytes + 11) & !7` per allocation (an 8-byte header, rounded to 8 bytes).
+pub(super) fn dm_heap(state_bytes: u32, arena: Option<Arena>) -> u32 {
+    STOCK_DM_HEAP - heap_charge(STOCK_STATE_BYTES)
+        + heap_charge(state_bytes)
+        + arena
+            .filter(|arena| arena.heap == Heap::Dm)
+            .map_or(0, |arena| heap_charge(arena.bytes()))
 }
 
 fn heap_charge(bytes: u32) -> u32 {
@@ -101,11 +118,12 @@ pub fn module_element(
     // The arena follows from the block's layout, as in `device::build`.
     let (layout, _) = super::generate(block)?;
     let mut xml = format!(
-        r#"<Module name="{}" blob_name="{}" id="{model_id}" category="{}" dm_heap="{}" pm_heap="0" sd_heap="0" dma="0" pm="0" dm="32" sw="{}" sw_pad="{SW_PAD}" nw="0" cpu_pad="0.4" Latency="0">"#,
+        r#"<Module name="{}" blob_name="{}" id="{model_id}" category="{}" dm_heap="{}" pm_heap="0" sd_heap="{}" dma="0" pm="0" dm="32" sw="{}" sw_pad="{SW_PAD}" nw="0" cpu_pad="0.4" Latency="0">"#,
         escape(display_name)?,
         escape(blob_name)?,
         block.category().id(),
         resources.dm_heap(layout.arena),
+        resources.sd_heap(layout.arena),
         resources.code_bytes + SW_PAD,
     );
     for test in [
@@ -151,9 +169,14 @@ mod tests {
     }
 
     fn arena(bytes: u32) -> Option<Arena> {
+        arena_in(Heap::Dm, bytes)
+    }
+
+    fn arena_in(heap: Heap, bytes: u32) -> Option<Arena> {
         Some(Arena {
             pointer: 17,
             words: bytes / 4,
+            heap,
         })
     }
 
@@ -169,5 +192,17 @@ mod tests {
         let budget = DM_HEAP_BYTES - state - 8;
         assert!(r.check_heaps(arena(budget)).is_ok());
         assert!(r.check_heaps(arena(budget + 8)).is_err());
+    }
+
+    /// An SD arena is charged to the SD heap only, up to the heap's length.
+    #[test]
+    fn sd_arena_is_charged_to_the_sd_heap_up_to_its_size() {
+        let r = resources(72);
+        let sd = arena_in(Heap::Sd, 524_288);
+        assert_eq!(r.dm_heap(sd), r.dm_heap(None));
+        assert_eq!(r.sd_heap(sd), 524_296);
+        assert_eq!(r.sd_heap(arena(524_288)), 0);
+        assert!(r.check_heaps(arena_in(Heap::Sd, SD_HEAP_BYTES - 8)).is_ok());
+        assert!(r.check_heaps(arena_in(Heap::Sd, SD_HEAP_BYTES)).is_err());
     }
 }

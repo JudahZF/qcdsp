@@ -32,7 +32,7 @@ pub const STOCK_STATE_BYTES: u32 = 0x44;
 pub const MAX_STATE_BYTES: u32 = 0x7fff;
 /// Stock init function; the generated init tail-jumps here.
 pub const STOCK_INIT: u32 = 0xe2;
-/// Stock destroy (ctx[8]): frees the state with `free`. A generated destroy tail-jumps here.
+/// Stock destroy (`ctx[8]`): frees the state with `free`. A generated destroy tail-jumps here.
 pub const STOCK_DESTROY: u32 = 0x11;
 /// Samples per channel per process call, and channel pointers in the descriptor.
 pub const BLOCK_SAMPLES: u32 = 32;
@@ -46,12 +46,12 @@ pub const STOCK_CPU: f64 = 0.72;
 /// come from the [`KernelMap`] given to [`VolumeTemplate::with_kernel`].
 pub const HEAP_MALLOC: u32 = 0x16_adfa;
 pub const HEAP_FREE: u32 = 0x16_ad7e;
-/// Arenas use heap 0, the DM heap in L1 block 0 (k1 heap table DM `0x242348`; the core 2 kernel
-/// has the same heaps 0 and 1). It is the larger L1 heap and the one Volume's own state comes
-/// from; generated code never pairs a DM and a PM access, so heap 1 would gain nothing.
-pub const ARENA_HEAP: u32 = 0;
-/// Length of heap 0 in bytes (`0x257f8`). A block whose DM heap figure exceeds it can never fit.
+/// Length of heap 0 in bytes (`0x257f8`; the core 2 kernel has the same heaps 0 and 1). A block
+/// whose DM heap figure exceeds it can never fit.
 pub const DM_HEAP_BYTES: u32 = 153_592;
+/// Length of heap 2, the SD heap, in bytes (`0xfffef8`, base `0x80000000` on core 1 and
+/// `0x81000000` on core 2).
+pub const SD_HEAP_BYTES: u32 = 0xff_fef8;
 /// A stock blob that calls both heap functions (digital_delay: `heap_malloc` at `0x38c4`,
 /// `heap_free` at `0x39a2`), so its per-core records give their core 2-4 addresses
 /// ([`KernelMap::add_stock_calls`]).

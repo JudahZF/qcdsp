@@ -9,7 +9,7 @@
 //!                    one bank per computed channel (two for stereo, one for mono)
 //! ```
 //! When the banks do not fit Volume's allocation, they move to an arena that the generated init
-//! takes from the kernel heap ([`ARENA_HEAP`](super::template::ARENA_HEAP)), and the state ends with the arena pointer:
+//! takes from a kernel heap ([`Heap`]), and the state ends with the arena pointer:
 //! ```text
 //! state: [0, 17+P+C) as above, then one word: the arena pointer (0 when the allocation failed)
 //! arena: bank(c) for each computed channel, from offset 0
@@ -18,7 +18,10 @@
 //! unqualified normal-word loads/stores with these offsets, which the DAG scales
 //! for byte-addressed pointers, so no pointer arithmetic is done in data registers.
 
-use super::template::{MAX_STATE_BYTES, STOCK_STATE_BYTES};
+use super::{
+    metadata,
+    template::{DM_HEAP_BYTES, MAX_STATE_BYTES, STOCK_STATE_BYTES},
+};
 use crate::{Block, Error, Result, codegen::Contract};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -40,12 +43,26 @@ pub struct Layout {
     pub arena: Option<Arena>,
 }
 
-/// Bank memory taken with `heap_malloc(ARENA_HEAP, bytes)` when the banks do not fit the state.
+/// Bank memory taken with `heap_malloc(heap, bytes)` when the banks do not fit the state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Arena {
     /// Word offset of the arena pointer in the state.
     pub pointer: u32,
     pub words: u32,
+    pub heap: Heap,
+}
+
+/// The kernel heap an arena comes from; the value is `heap_malloc`'s index (k1 heap table DM
+/// `0x242348`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Heap {
+    /// Heap 0, L1 block 0: the heap Volume's own state comes from. An arena uses it while the
+    /// block's DM figure fits the heap. Generated code never pairs a DM and a PM access, so
+    /// heap 1 (PM) would gain nothing.
+    Dm = 0,
+    /// Heap 2, the core's 16 MiB of DDR (`0x80000000` on core 1): for arenas that do not fit
+    /// heap 0. Plain DM loads and stores reach it, as stock GRU amps read their weights.
+    Sd = 2,
 }
 
 impl Arena {
@@ -83,10 +100,14 @@ impl Layout {
                 if banked.checked_mul(4).is_none_or(|b| b > i32::MAX as u32) || !fits(first + 1) {
                     return Err(too_large());
                 }
-                let arena = Arena {
+                let mut arena = Arena {
                     pointer: first,
                     words: banked,
+                    heap: Heap::Dm,
                 };
+                if metadata::dm_heap((first + 1) * 4, Some(arena)) > DM_HEAP_BYTES {
+                    arena.heap = Heap::Sd;
+                }
                 (0, first + 1, Some(arena))
             }
         };
@@ -140,5 +161,28 @@ mod tests {
         assert_eq!(outside.banks, [0, outside.bank_words]);
         assert_eq!(arena.words, 2 * outside.bank_words);
         assert_eq!(arena.bytes(), 8 * outside.bank_words);
+        assert_eq!(arena.heap, super::Heap::Dm);
+    }
+
+    /// An arena stays in heap 0 while the block's DM figure fits it, and moves to the SD heap
+    /// from the first delay sample that does not.
+    #[test]
+    fn arenas_move_to_the_sd_heap_when_they_do_not_fit_heap_0() {
+        use super::{Arena, DM_HEAP_BYTES, Heap, metadata};
+        let heap = |samples| layout(samples).arena.unwrap().heap;
+        assert_eq!(heap(9000), Heap::Dm);
+        assert_eq!(heap(65_536), Heap::Sd);
+        let lengths: Vec<usize> = (9000..65_536).collect();
+        let first_sd = lengths[lengths.partition_point(|&n| heap(n) == Heap::Dm)];
+        let figure_in_dm = |samples| {
+            let l = layout(samples);
+            let arena = Arena {
+                heap: Heap::Dm,
+                ..l.arena.unwrap()
+            };
+            metadata::dm_heap(l.bytes(), Some(arena))
+        };
+        assert!(figure_in_dm(first_sd - 1) <= DM_HEAP_BYTES);
+        assert!(figure_in_dm(first_sd) > DM_HEAP_BYTES);
     }
 }
