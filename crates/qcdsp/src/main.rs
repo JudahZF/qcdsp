@@ -231,14 +231,27 @@ fn report(outcome: qc_deploy::InstallOutcome) {
 }
 
 /// The stock Volume template from the snapshot: decrypted core 1 blob plus its
-/// per-core diff records.
+/// per-core diff records, and the kernel map that blocks with an arena need.
 fn template(
     snapshot: &qc_deploy::Snapshot,
     secrets: &keys::DeviceSecrets,
 ) -> Result<VolumeTemplate, Box<dyn Error>> {
+    let (core1, diffs) = stock_blob(snapshot, secrets, "volume")?;
+    let (calls, call_diffs) = stock_blob(snapshot, secrets, device::template::KERNEL_CALL_SOURCE)?;
+    let mut kernel = qc_link::KernelMap::default();
+    kernel.add_stock_calls(&qc_format::blob::ModuleBlob::parse(&calls)?, &call_diffs)?;
+    Ok(VolumeTemplate::new(&core1, diffs)?.with_kernel(kernel))
+}
+
+/// A decrypted stock core 1 blob and its records for cores 2-4.
+fn stock_blob(
+    snapshot: &qc_deploy::Snapshot,
+    secrets: &keys::DeviceSecrets,
+    name: &str,
+) -> Result<(Vec<u8>, [qc_format::diff::DiffRecord; 3]), Box<dyn Error>> {
     let root = snapshot.root();
     let core1 = qc_format::crypto::crypt(
-        &fs::read(root.join("blobs/core1/volume_blob.bin"))?,
+        &fs::read(root.join(format!("blobs/core1/{name}_blob.bin")))?,
         &secrets.blob,
     );
     let mut diffs = Vec::new();
@@ -247,15 +260,12 @@ fn template(
             root.join(format!("blobs/core{core}/diffs.blob")),
         )?)?;
         diffs.push(
-            file.get("volume")
-                .ok_or("volume has no per-core record")?
+            file.get(name)
+                .ok_or_else(|| format!("{name} has no core {core} record"))?
                 .clone(),
         );
     }
-    Ok(VolumeTemplate::new(
-        &core1,
-        diffs.try_into().expect("three cores"),
-    )?)
+    Ok((core1, diffs.try_into().expect("three cores")))
 }
 
 #[derive(Args)]
