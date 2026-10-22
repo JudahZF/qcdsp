@@ -31,7 +31,7 @@ impl From<Register> for UniversalRegister {
     }
 }
 
-/// An I0..I15 index register. DM accesses in this subset require DAG1 (I0..I7).
+/// An I0..I15 index register. I0..I7 are DAG1 (DM), I8..I15 are DAG2 (PM).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IndexRegister(Register);
 
@@ -54,7 +54,7 @@ impl From<IndexRegister> for UniversalRegister {
     }
 }
 
-/// An M0..M15 modifier register. DM accesses in this subset require M0..M7.
+/// An M0..M15 modifier register. M0..M7 are DAG1 (DM), M8..M15 are DAG2 (PM).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ModifyRegister(Register);
 
@@ -128,14 +128,208 @@ pub enum VisaError {
     DuplicateLabel(String),
     #[error("undefined VISA label {0:?}")]
     UndefinedLabel(String),
+    #[error("PM index I{0} is not a DAG2 index (I8..I15)")]
+    InvalidPmIndex(u8),
+    #[error("PM modifier M{0} is not a DAG2 modifier (M8..M15)")]
+    InvalidPmModifier(u8),
+    #[error("index I{index} and modifier M{modifier} belong to different DAGs")]
+    MixedDag { index: u8, modifier: u8 },
+    #[error("ureg {0:#x} belongs to the DAG that addresses this access (PRM UREGXDAG1/UREGXDAG2)")]
+    SameDagRegister(u8),
+    #[error("instruction is not a single-function compute")]
+    NotACompute,
+    #[error("F{register} cannot be the multifunction {operand}; it must be one of {allowed}")]
+    MultifunctionOperand {
+        operand: &'static str,
+        register: u8,
+        allowed: &'static str,
+    },
+    #[error("R{0} is the destination of two parallel operations")]
+    DuplicateDestination(u8),
+    #[error("a loop count of zero is not supported")]
+    LoopCountZero,
+    #[error("loop end offset {0} is outside the signed 23-bit parcel range")]
+    LoopOutOfRange(i64),
+    #[error("hardware loop has no body instruction")]
+    EmptyLoop,
+    #[error("loop_begin without a matching loop_end")]
+    UnclosedLoop,
+    #[error("loop_end without an open loop")]
+    UnmatchedLoopEnd,
+    #[error("nested loops end on the same instruction")]
+    SharedLoopEnd,
+    #[error(
+        "the instruction at parcel {0:#x} is one of the last 11 of a loop body but is not 48-bit"
+    )]
+    LoopTailNotFullWidth(usize),
+    #[error("a branch, call or return sits in a hardware loop body")]
+    BranchInLoop,
+    #[error("label {0:?} sits in a hardware loop body")]
+    LabelInLoop(String),
 }
 
-/// Verified VISA forms needed by a leaf callback.
+/// MODE1 bit 21: PEy enable (SIMD). The mode changes one cycle after the write.
+pub const MODE1_PEYEN: u32 = 1 << 21;
+/// MODE1 bit 22: broadcast loads through I9 to PEx and PEy.
+pub const MODE1_BDCST9: u32 = 1 << 22;
+/// MODE1 bit 23: broadcast loads through I1 to PEx and PEy.
+pub const MODE1_BDCST1: u32 = 1 << 23;
+
+/// Memory transfer direction, seen from the register.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Direction {
+    /// `register = memory`.
+    Load,
+    /// `memory = register`.
+    Store,
+}
+
+/// Type 3a address update: `(I, M)` post-modify or `(M, I)` pre-modify.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Update {
+    /// `(Ia, Mb)`: address Ia, then Ia += Mb.
+    PostModify,
+    /// `(Mb, Ia)`: address Ia + Mb; Ia is not updated.
+    PreModify,
+}
+
+/// The ALU half of a float multiplier/ALU multifunction compute.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AluOp {
+    /// `Fa = Fxa + Fya` (opcode `011000`).
+    Add,
+    /// `Fa = Fxa - Fya` (opcode `011001`).
+    Sub,
+}
+
+/// `Fm = Fxm * Fym, Fa = Fxa +/- Fya`: the float multiplier and ALU in one compute.
+///
+/// The PRM restricts the inputs to register groups: `mul_x` F0-F3, `mul_y` F4-F7,
+/// `alu_x` F8-F11, `alu_y` F12-F15. The two destinations are free but must differ.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FloatMulAlu {
+    pub product: Register,
+    pub mul_x: Register,
+    pub mul_y: Register,
+    pub op: AluOp,
+    pub alu_dst: Register,
+    pub alu_x: Register,
+    pub alu_y: Register,
+}
+
+/// A validated 23-bit compute field for Types 1a, 2a and 3a.
+///
+/// Build one from a single-function compute instruction ([`Compute::single`]) or a
+/// float multiplier/ALU multifunction ([`Compute::float_mul_alu`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Compute {
+    field: u32,
+    destinations: [Option<Register>; 2],
+}
+
+impl Compute {
+    /// The compute field of a single-function compute: `Instruction::{FloatAdd, FloatSub,
+    /// FloatMul, FloatMin, FloatMax, FloatNeg, FloatAbs, FloatPass, IntegerSub}` or
+    /// `VisaInstruction::{IntegerSubOne, IntegerPass, IntegerCompareUnsigned}`.
+    pub fn single(instruction: impl Into<VisaInstruction>) -> Result<Self, VisaError> {
+        let instruction = instruction.into();
+        let destination = instruction.compute_destination()?;
+        let word = instruction
+            .parcels()?
+            .into_iter()
+            .fold(0_u64, |word, parcel| (word << 16) | u64::from(parcel));
+        Ok(Self {
+            field: (word & 0x7f_ffff) as u32,
+            destinations: [destination, None],
+        })
+    }
+
+    /// PRM "Multiplier and ALU" multifunction field: bit 22 = 1, opcode 21:16,
+    /// Fm 15:12, Fa 11:8, then the 2-bit group offsets of Fxm, Fym, Fxa, Fya.
+    pub fn float_mul_alu(compute: FloatMulAlu) -> Result<Self, VisaError> {
+        let operand = |register: Register, base: u8, operand, allowed| {
+            if register.index() & !3 == base {
+                Ok(u32::from(register.index() & 3))
+            } else {
+                Err(VisaError::MultifunctionOperand {
+                    operand,
+                    register: register.index(),
+                    allowed,
+                })
+            }
+        };
+        let mul_x = operand(compute.mul_x, 0, "multiplier X input", "F0-F3")?;
+        let mul_y = operand(compute.mul_y, 4, "multiplier Y input", "F4-F7")?;
+        let alu_x = operand(compute.alu_x, 8, "ALU X input", "F8-F11")?;
+        let alu_y = operand(compute.alu_y, 12, "ALU Y input", "F12-F15")?;
+        if compute.product == compute.alu_dst {
+            return Err(VisaError::DuplicateDestination(compute.product.index()));
+        }
+        let opcode = match compute.op {
+            AluOp::Add => 0x18,
+            AluOp::Sub => 0x19,
+        };
+        Ok(Self {
+            field: (1 << 22)
+                | (opcode << 16)
+                | (u32::from(compute.product.index()) << 12)
+                | (u32::from(compute.alu_dst.index()) << 8)
+                | (mul_x << 6)
+                | (mul_y << 4)
+                | (alu_x << 2)
+                | alu_y,
+            destinations: [Some(compute.product), Some(compute.alu_dst)],
+        })
+    }
+
+    /// The 23-bit field placed in bits 22:0 of the instruction.
+    pub const fn field(self) -> u32 {
+        self.field
+    }
+}
+
+/// One post-modify half of a Type 1a dual move: a PEx data register and `(I, M)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DataAccess {
+    pub direction: Direction,
+    pub register: Register,
+    pub index: IndexRegister,
+    pub modifier: ModifyRegister,
+}
+
+/// A Type 3a single access. I0-I7 with M0-M7 address DM through DAG1;
+/// I8-I15 with M8-M15 address PM through DAG2 (the G bit).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MemoryAccess {
+    pub direction: Direction,
+    pub register: UniversalRegister,
+    pub index: IndexRegister,
+    pub modifier: ModifyRegister,
+    pub update: Update,
+}
+
+/// Type 12a loop count: `LCNTR = data16` or `LCNTR = ureg`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoopCount {
+    Immediate(u16),
+    /// The register must hold a nonzero count; the encoder cannot check it.
+    Register(UniversalRegister),
+}
+
+/// Type 12a mode bit 23. F1-active ends a loop with no lost cycles; it is valid
+/// because loop bodies in this crate never hold a change of flow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoopMode {
+    E2Active,
+    F1Active,
+}
+
+/// Verified VISA forms for leaf callbacks and frame kernels.
 ///
 /// Post-modify DM data-register accesses use verified 16-bit forms. Transfers and
 /// other small DM accesses use 32-bit forms. Other operations use full 48-bit forms.
 /// `LeafReturn` is the stock six-parcel, four-instruction return sequence, not a
-/// generic RTS.
+/// generic RTS. Only 48-bit forms may end a hardware loop: see the README table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VisaInstruction {
     Scalar(Instruction),
@@ -225,6 +419,39 @@ pub enum VisaInstruction {
     /// I12=DM(M7,I6); JUMP(M14,I12)(DB); RFRAME; NOP.
     /// Assumes the stock C-runtime frame and M7/M14 values; not an ABI validator.
     LeafReturn,
+    /// Type 2a `compute;` with any [`Compute`], including multifunction. 48-bit.
+    Compute(Compute),
+    /// Type 1a `compute, DM(Ia,Mb) <-> Rx, PM(Ic,Md) <-> Ry;`. 48-bit.
+    /// Both accesses always happen: `dm` must use I0-I7/M0-M7, `pm` I8-I15/M8-M15.
+    DualMove {
+        compute: Option<Compute>,
+        dm: DataAccess,
+        pm: DataAccess,
+    },
+    /// Type 3a `compute, ureg <-> DM|PM(...);`, unconditional, normal word. 48-bit.
+    MemoryMove {
+        compute: Option<Compute>,
+        access: MemoryAccess,
+    },
+    /// Type 16a `DM(Ia,Mb) = imm32` (I0-I7) or `PM(Ic,Md) = imm32` (I8-I15),
+    /// post-modify. 48-bit.
+    StoreImmediate {
+        index: IndexRegister,
+        modifier: ModifyRegister,
+        value: u32,
+    },
+    /// Type 18a `BIT SET MODE1 mask;`. 48-bit.
+    BitSetMode1 {
+        mask: u32,
+    },
+    /// Type 18a `BIT CLR MODE1 mask;`. 48-bit.
+    BitClearMode1 {
+        mask: u32,
+    },
+    /// Type 21c `NOP;`, 16 bits. Not valid in the last 11 instructions of a loop.
+    Nop,
+    /// Type 21a `NOP;`, the 48-bit all-zero word.
+    WideNop,
 }
 
 impl From<Instruction> for VisaInstruction {
@@ -315,8 +542,56 @@ impl VisaInstruction {
             // Type 16a: 100, 1, I=7 (43:41), M=7 (40:38), G=0, DATA32.
             Self::PushImmediate { value } => 0x9fc0_0000_0000 | u64::from(value),
             Self::LeafReturn => return Ok(LEAF_RETURN_PARCELS.to_vec()),
+            // Type 2a shell: bit 40, COND=11111 in 37:33.
+            Self::Compute(compute) => (1 << 40) | (0x1f << 33) | u64::from(compute.field),
+            Self::DualMove { compute, dm, pm } => dual_move(compute, dm, pm)?,
+            Self::MemoryMove { compute, access } => memory_move(compute, access)?,
+            Self::StoreImmediate {
+                index,
+                modifier,
+                value,
+            } => {
+                // Type 16a: 1001, I 43:41, M 40:38, G 37, 36:34 = 000, SL=BY=0.
+                let (i, m, pm) = dag_fields(index, modifier)?;
+                (0x9 << 44) | (i << 41) | (m << 38) | (u64::from(pm) << 37) | u64::from(value)
+            }
+            // Type 18a: 00010100, BOP 39:37 (SET 000, CLR 001), SREG 35:32 (MODE1 = 2).
+            Self::BitSetMode1 { mask } => 0x1402_0000_0000 | u64::from(mask),
+            Self::BitClearMode1 { mask } => 0x1422_0000_0000 | u64::from(mask),
+            Self::Nop => return Ok(vec![0x0001]),
+            Self::WideNop => 0,
         };
         Ok(full_word_parcels(word))
+    }
+
+    /// Changes of flow, which this crate keeps out of hardware loop bodies.
+    fn is_branch(self) -> bool {
+        matches!(
+            self,
+            Self::JumpRelative { .. } | Self::CJump { .. } | Self::LeafReturn
+        )
+    }
+
+    /// The destination of a single-function compute form, or `NotACompute`.
+    fn compute_destination(self) -> Result<Option<Register>, VisaError> {
+        use Instruction as I;
+        match self {
+            Self::Scalar(
+                I::FloatAdd { dst, .. }
+                | I::FloatSub { dst, .. }
+                | I::FloatMul { dst, .. }
+                | I::FloatMin { dst, .. }
+                | I::FloatMax { dst, .. }
+                | I::FloatNeg { dst, .. }
+                | I::FloatAbs { dst, .. }
+                | I::FloatPass { dst, .. }
+                | I::IntegerSub { dst, .. },
+            )
+            | Self::IntegerSubOne { dst, .. }
+            | Self::IntegerPass { dst, .. } => Ok(Some(dst)),
+            Self::IntegerCompareUnsigned { .. } => Ok(None),
+            _ => Err(VisaError::NotACompute),
+        }
     }
 
     /// Emits section-2 bytes: high-to-low parcels, each parcel little-endian.
@@ -342,6 +617,107 @@ fn check_store_source(register: UniversalRegister) -> Result<(), VisaError> {
         return Err(VisaError::Dag1StoreSource(code));
     }
     Ok(())
+}
+
+/// The 3-bit I and M fields and whether the pair is DAG2 (PM, G=1).
+fn dag_fields(
+    index: IndexRegister,
+    modifier: ModifyRegister,
+) -> Result<(u64, u64, bool), VisaError> {
+    let pm = index.index() >= 8;
+    if (modifier.index() >= 8) != pm {
+        return Err(VisaError::MixedDag {
+            index: index.index(),
+            modifier: modifier.index(),
+        });
+    }
+    Ok((
+        u64::from(index.index() & 7),
+        u64::from(modifier.index() & 7),
+        pm,
+    ))
+}
+
+/// `true` if the ureg is an I, M, L or B register of the given DAG.
+fn in_dag(register: UniversalRegister, pm: bool) -> bool {
+    let code = register.code();
+    matches!(code >> 4, 1..=4) && ((code & 0x0f) >= 8) == pm
+}
+
+/// PRM 05.48: parallel operations may not share a destination register.
+fn check_destinations(
+    compute: Option<Compute>,
+    loads: impl IntoIterator<Item = u8>,
+) -> Result<(), VisaError> {
+    let mut written: Vec<u8> = compute
+        .into_iter()
+        .flat_map(|compute| compute.destinations)
+        .flatten()
+        .map(Register::index)
+        .collect();
+    for load in loads {
+        if written.contains(&load) {
+            return Err(VisaError::DuplicateDestination(load));
+        }
+        written.push(load);
+    }
+    Ok(())
+}
+
+/// Type 1a: 001, DMD 44, DMI 43:41, DMM 40:38, PMD 37, DMDREG 36:33,
+/// PMI 32:30, PMM 29:27, PMDREG 26:23, COMPUTE 22:0.
+fn dual_move(compute: Option<Compute>, dm: DataAccess, pm: DataAccess) -> Result<u64, VisaError> {
+    if dm.index.index() >= 8 {
+        return Err(VisaError::InvalidDmIndex(dm.index.index()));
+    }
+    if dm.modifier.index() >= 8 {
+        return Err(VisaError::InvalidDmModifier(dm.modifier.index()));
+    }
+    if pm.index.index() < 8 {
+        return Err(VisaError::InvalidPmIndex(pm.index.index()));
+    }
+    if pm.modifier.index() < 8 {
+        return Err(VisaError::InvalidPmModifier(pm.modifier.index()));
+    }
+    let loads = [dm, pm]
+        .into_iter()
+        .filter(|access| access.direction == Direction::Load)
+        .map(|access| access.register.index());
+    check_destinations(compute, loads)?;
+    let store = |access: DataAccess| u64::from(access.direction == Direction::Store);
+    Ok((1 << 45)
+        | (store(dm) << 44)
+        | (u64::from(dm.index.index()) << 41)
+        | (u64::from(dm.modifier.index()) << 38)
+        | (store(pm) << 37)
+        | (u64::from(dm.register.index()) << 33)
+        | (u64::from(pm.index.index() & 7) << 30)
+        | (u64::from(pm.modifier.index() & 7) << 27)
+        | (u64::from(pm.register.index()) << 23)
+        | u64::from(compute.map_or(0, Compute::field)))
+}
+
+/// Type 3a: 010, U 44, I 43:41, M 40:38, COND 37:33, G 32, D 31, L 30,
+/// UREG 29:23, COMPUTE 22:0. Post-modify accesses and all stores need a ureg
+/// outside the addressing DAG (UREGXDAG1 / UREGXDAG2); pre-modify loads take any ureg.
+fn memory_move(compute: Option<Compute>, access: MemoryAccess) -> Result<u64, VisaError> {
+    let (i, m, pm) = dag_fields(access.index, access.modifier)?;
+    let post = access.update == Update::PostModify;
+    let store = access.direction == Direction::Store;
+    if (post || store) && in_dag(access.register, pm) {
+        return Err(VisaError::SameDagRegister(access.register.code()));
+    }
+    let code = access.register.code();
+    check_destinations(compute, (!store && code < 16).then_some(code))?;
+    Ok((2 << 45)
+        | (u64::from(post) << 44)
+        | (i << 41)
+        | (m << 38)
+        | (0x1f << 33)
+        | (u64::from(pm) << 32)
+        | (u64::from(store) << 31)
+        | (u64::from(code) << 23)
+        | u64::from(compute.map_or(0, Compute::field)))
 }
 
 fn dm_index(index: IndexRegister) -> Result<u64, VisaError> {
@@ -441,9 +817,41 @@ enum Item {
         condition: Condition,
         target: String,
     },
+    LoopBegin {
+        count: LoopCount,
+        mode: LoopMode,
+    },
+    LoopEnd,
 }
 
-/// A VISA stream with local, PC-relative labels measured in 16-bit parcels.
+/// The PRM (`.06.062`) requires the last 11 instructions of a loop body to be 48-bit.
+const LOOP_TAIL: usize = 11;
+
+/// A loop whose `loop_end` has not been reached yet.
+struct OpenLoop {
+    /// Parcel address of the Type 12a instruction.
+    at: usize,
+    count: LoopCount,
+    mode: LoopMode,
+    /// Index of the first body instruction in the instruction list.
+    first: usize,
+}
+
+/// Type 12a: 0x0c DATA16 39:24 or 0x0d UREG 38:32, MODE 23, RELADDR 22:0.
+fn loop_word(count: LoopCount, mode: LoopMode, offset: i64) -> Result<u64, VisaError> {
+    if !(-0x40_0000..=0x3f_ffff).contains(&offset) {
+        return Err(VisaError::LoopOutOfRange(offset));
+    }
+    let count = match count {
+        LoopCount::Immediate(0) => return Err(VisaError::LoopCountZero),
+        LoopCount::Immediate(count) => (0x0c << 40) | (u64::from(count) << 24),
+        LoopCount::Register(register) => (0x0d << 40) | (u64::from(register.code()) << 32),
+    };
+    Ok(count | (u64::from(mode == LoopMode::F1Active) << 23) | ((offset as u64) & 0x7f_ffff))
+}
+
+/// A VISA stream with local, PC-relative labels and counted hardware loops,
+/// measured in 16-bit parcels.
 /// No instruction alignment padding, compression pass, or scheduling is performed.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct VisaProgram {
@@ -472,47 +880,110 @@ impl VisaProgram {
         });
     }
 
-    /// Instructions, jumps included; labels are not instructions. A SHARC+ core issues one
-    /// instruction per cycle whatever its parcel width, so this (not the parcel count) is
-    /// the base of a cycle estimate.
+    /// Emits a 48-bit Type 12a `LCNTR = count, DO (PC, reladdr) UNTIL LCE`. The body is
+    /// every instruction pushed until the matching [`loop_end`](Self::loop_end); loops nest.
+    ///
+    /// `parcels()` rejects the loop if any of the last 11 body instructions (all of
+    /// them for a shorter body) is not 48-bit, if the body holds a jump, call, return
+    /// or label, if it is empty, or if a nested loop ends on the same instruction.
+    pub fn loop_begin(&mut self, count: LoopCount, mode: LoopMode) {
+        self.items.push(Item::LoopBegin { count, mode });
+    }
+
+    /// Closes the innermost open loop: the instruction pushed last is its end.
+    pub fn loop_end(&mut self) {
+        self.items.push(Item::LoopEnd);
+    }
+
+    /// Instructions, jumps and loop starts included; labels and loop ends are not
+    /// instructions. A SHARC+ core issues one instruction per cycle whatever its parcel
+    /// width, so this (not the parcel count) is the base of a cycle estimate.
     pub fn instruction_count(&self) -> usize {
         self.items
             .iter()
-            .filter(|item| !matches!(item, Item::Label(_)))
+            .filter(|item| !matches!(item, Item::Label(_) | Item::LoopEnd))
             .count()
     }
 
-    /// Parcels emitted so far. Labels are not resolved (a jump is always three parcels), so
-    /// this works while a forward label is still undefined.
+    /// Parcels emitted so far. Labels are not resolved (a jump or loop start is always
+    /// three parcels), so this works while a forward label is still undefined.
     pub fn parcel_count(&self) -> Result<usize, VisaError> {
         self.items
             .iter()
             .map(|item| match item {
                 Item::Instruction(instruction) => instruction.parcels().map(|p| p.len()),
-                Item::Label(_) => Ok(0),
-                Item::Jump { .. } => Ok(3),
+                Item::Label(_) | Item::LoopEnd => Ok(0),
+                Item::Jump { .. } | Item::LoopBegin { .. } => Ok(3),
             })
             .sum()
     }
 
-    /// Resolves labels and returns parcels in execution order. Labels emit nothing.
+    /// Resolves labels and loops and returns parcels in execution order. Labels emit
+    /// nothing. A loop's reladdr is the first parcel of its last body instruction minus
+    /// the first parcel of the DO instruction.
     pub fn parcels(&self) -> Result<Vec<u16>, VisaError> {
         let mut labels = HashMap::new();
         let mut parcels = Vec::new();
         let mut fixups = Vec::new();
+        // (first parcel, parcel count) of every instruction, for the loop-tail rule.
+        let mut instructions: Vec<(usize, usize)> = Vec::new();
+        let mut open: Vec<OpenLoop> = Vec::new();
+        let mut last_end = None;
         for item in &self.items {
             match item {
-                Item::Instruction(instruction) => parcels.extend(instruction.parcels()?),
+                Item::Instruction(instruction) => {
+                    if !open.is_empty() && instruction.is_branch() {
+                        return Err(VisaError::BranchInLoop);
+                    }
+                    let words = instruction.parcels()?;
+                    instructions.push((parcels.len(), words.len()));
+                    parcels.extend(words);
+                }
                 Item::Label(name) => {
+                    if !open.is_empty() {
+                        return Err(VisaError::LabelInLoop(name.clone()));
+                    }
                     if labels.insert(name.as_str(), parcels.len()).is_some() {
                         return Err(VisaError::DuplicateLabel(name.clone()));
                     }
                 }
                 Item::Jump { condition, target } => {
+                    if !open.is_empty() {
+                        return Err(VisaError::BranchInLoop);
+                    }
                     fixups.push((parcels.len(), *condition, target));
+                    instructions.push((parcels.len(), 3));
                     parcels.extend([0; 3]);
                 }
+                &Item::LoopBegin { count, mode } => {
+                    instructions.push((parcels.len(), 3));
+                    open.push(OpenLoop {
+                        at: parcels.len(),
+                        count,
+                        mode,
+                        first: instructions.len(),
+                    });
+                    parcels.extend([0; 3]);
+                }
+                Item::LoopEnd => {
+                    let open = open.pop().ok_or(VisaError::UnmatchedLoopEnd)?;
+                    let body = &instructions[open.first..];
+                    let &(end, _) = body.last().ok_or(VisaError::EmptyLoop)?;
+                    if last_end.replace(end) == Some(end) {
+                        return Err(VisaError::SharedLoopEnd);
+                    }
+                    if let Some(&(at, _)) = body.iter().rev().take(LOOP_TAIL).find(|i| i.1 != 3) {
+                        return Err(VisaError::LoopTailNotFullWidth(at));
+                    }
+                    let offset = end as i64 - open.at as i64;
+                    parcels[open.at..open.at + 3].copy_from_slice(&full_word_parcels(loop_word(
+                        open.count, open.mode, offset,
+                    )?));
+                }
             }
+        }
+        if !open.is_empty() {
+            return Err(VisaError::UnclosedLoop);
         }
         for (at, condition, target) in fixups {
             let &destination = labels

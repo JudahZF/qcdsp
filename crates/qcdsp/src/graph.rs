@@ -5,7 +5,7 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-use crate::{Error, Result};
+use crate::{Error, Result, network::Network};
 
 static NEXT_GRAPH: AtomicU64 = AtomicU64::new(1);
 
@@ -192,6 +192,8 @@ pub(crate) enum Node {
     Sigmoid {
         input: usize,
     },
+    /// The output of the block's network for this sample (IR 3).
+    Network,
 }
 
 impl Node {
@@ -236,10 +238,10 @@ impl Node {
 
 /// `0x7ef311c7 - bits(x)` is within 12% of `1/x` for normal `x` of either sign
 /// (the sign bit wraps); three Newton steps bring it to about 2^-22.
-const RECIP_MAGIC: u32 = 0x7ef3_11c7;
+pub(crate) const RECIP_MAGIC: u32 = 0x7ef3_11c7;
 const RECIP_NEWTON_STEPS: usize = 3;
 /// Padé (7, 6) of tanh reaches 1 near here; outside it the output is clamped.
-const TANH_LIMIT: f32 = 4.97;
+pub(crate) const TANH_LIMIT: f32 = 4.97;
 
 /// Builds the primitive expansion of macro nodes into a new node list.
 struct Expander {
@@ -338,6 +340,9 @@ pub struct Block {
     pub(crate) delays: Vec<Memory<usize>>,
     pub(crate) nodes: Vec<Node>,
     pub(crate) output: usize,
+    /// IR 3: vector operations that run before the graph; `network` nodes read the output.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) network: Option<Network>,
 }
 
 fn is_stereo(channels: &Channels) -> bool {
@@ -415,6 +420,7 @@ impl Block {
                 Node::Neg { input } => expander.push(Node::Neg { input: map[input] }),
                 Node::Abs { input } => expander.push(Node::Abs { input: map[input] }),
                 Node::Input
+                | Node::Network
                 | Node::Constant { .. }
                 | Node::Parameter { .. }
                 | Node::State { .. }
@@ -452,8 +458,23 @@ impl Block {
     }
 
     pub fn validate(&self) -> Result<()> {
-        if !(1..=2).contains(&self.version) {
+        if !(1..=3).contains(&self.version) {
             return Err(Error::Invalid("unsupported IR version".into()));
+        }
+        let reads_network = self.nodes.iter().any(|node| *node == Node::Network);
+        match &self.network {
+            Some(network) => {
+                if self.version < 3 || self.channels != Channels::Mono {
+                    return Err(Error::Invalid(
+                        "a network needs IR version 3 and a mono block".into(),
+                    ));
+                }
+                network.validate(self.parameters.len())?;
+            }
+            None if reads_network => {
+                return Err(Error::Invalid("a network node needs a network".into()));
+            }
+            None => {}
         }
         if self.version == 1
             && (self.channels != Channels::Stereo || self.nodes.iter().any(Node::needs_ir2))
@@ -563,6 +584,7 @@ impl BlockBuilder {
                 delays: vec![],
                 nodes: vec![Node::Input],
                 output: 0,
+                network: None,
             },
             input: Signal { graph: id, node: 0 },
         }
@@ -721,6 +743,18 @@ impl BlockBuilder {
         Ok(self.push(Node::Sigmoid { input }))
     }
 
+    /// Run `network` before the graph and return its output for this sample. A block has at
+    /// most one network, and a network block is mono.
+    pub fn network(&mut self, network: Network) -> Result<Signal> {
+        if self.block.network.is_some() {
+            return Err(Error::Invalid("a block has at most one network".into()));
+        }
+        network.validate(self.block.parameters.len())?;
+        self.block.network = Some(network);
+        self.block.channels = Channels::Mono;
+        Ok(self.push(Node::Network))
+    }
+
     /// Compute channel A only and copy it to channel B (half the cost of stereo).
     pub fn mono(&mut self) {
         self.block.channels = Channels::Mono;
@@ -729,7 +763,11 @@ impl BlockBuilder {
     pub fn finish(mut self, output: Signal) -> Result<Block> {
         self.block.output = self.check(output)?;
         // Write the oldest IR version that holds the block, so older readers accept it.
-        if self.block.channels != Channels::Stereo || self.block.nodes.iter().any(Node::needs_ir2) {
+        if self.block.network.is_some() {
+            self.block.version = 3;
+        } else if self.block.channels != Channels::Stereo
+            || self.block.nodes.iter().any(Node::needs_ir2)
+        {
             self.block.version = 2;
         }
         self.block.validate()?;

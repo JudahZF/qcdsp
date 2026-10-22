@@ -30,6 +30,7 @@ use qc_format::blob::{CodeRelocation, Section};
 use qc_link::{KernelForm, KernelRef};
 
 use super::{
+    kernels,
     layout::{Arena, Heap, Layout},
     template::{
         BLOCK_SAMPLES, Entries, HEAP_FREE, HEAP_MALLOC, STOCK_DESTROY, STOCK_INIT, STOCK_PARCELS,
@@ -44,14 +45,16 @@ const COUNTER: u8 = 15;
 const CURSOR: u8 = 14;
 /// Callee-preserved data registers (CCES SHARC run-time model).
 const SAVED_DATA: [u8; 10] = [3, 5, 6, 7, 9, 10, 11, 13, 14, 15];
-const STATE: u8 = 0; // I0
+pub(super) const STATE: u8 = 0; // I0
 const AUDIO: u8 = 1; // I1
 const DELAY: u8 = 2; // I2, also M2
 /// Process: the bank base when there is an arena (else the banks are at STATE).
-const ARENA: u8 = 3; // I3
-const SCRATCH_INDEX: u8 = 4; // I4, caller-saved
+pub(super) const ARENA: u8 = 3; // I3
+pub(super) const SCRATCH_INDEX: u8 = 4; // I4, caller-saved
 const STACK: u8 = 7; // I7
-const FRAME: u8 = 6; // I6
+pub(super) const FRAME: u8 = 6; // I6
+/// Process of a network block: the network output row of this sample (two words a row).
+const NETWORK_OUTPUT: u8 = 5; // I5
 
 /// The generated routines: the parcels that follow the stock Volume code, their entries and
 /// the modeled instructions of one process call (the resource estimate).
@@ -59,6 +62,8 @@ pub struct Generated {
     pub parcels: Vec<u16>,
     pub entries: Entries,
     pub cycles_per_call: u64,
+    /// The part of `cycles_per_call` in network frame kernels (exact loop counts).
+    pub network_cycles_per_call: u64,
     /// The kernel calls (CJUMP sites, parcel offsets in section 2, with core 1 addresses) and
     /// the kind-7 relocations of their return literals. Both are empty without an arena.
     pub kernel_refs: Vec<KernelRef>,
@@ -71,26 +76,26 @@ struct Links {
     relocations: Vec<CodeRelocation>,
 }
 
-fn r(index: u8) -> Register {
+pub(super) fn r(index: u8) -> Register {
     Register::new(index).expect("register index below 16")
 }
-fn i(index: u8) -> IndexRegister {
+pub(super) fn i(index: u8) -> IndexRegister {
     IndexRegister::new(index).expect("index register below 16")
 }
-fn m(index: u8) -> ModifyRegister {
+pub(super) fn m(index: u8) -> ModifyRegister {
     ModifyRegister::new(index).expect("modify register below 16")
 }
-fn ureg_r(index: u8) -> UniversalRegister {
+pub(super) fn ureg_r(index: u8) -> UniversalRegister {
     r(index).into()
 }
-fn ureg_i(index: u8) -> UniversalRegister {
+pub(super) fn ureg_i(index: u8) -> UniversalRegister {
     i(index).into()
 }
-fn ureg_m(index: u8) -> UniversalRegister {
+pub(super) fn ureg_m(index: u8) -> UniversalRegister {
     m(index).into()
 }
 
-fn word(offset: u32) -> i32 {
+pub(super) fn word(offset: u32) -> i32 {
     i32::try_from(offset).expect("layout offsets fit in i32")
 }
 
@@ -109,14 +114,14 @@ pub fn generate(block: &Block, layout: &Layout, kernel: &Kernel) -> Result<Gener
     let init_start = STOCK_PARCELS;
     let init = init(block, layout, init_start, &mut links)?;
     let process_start = init_start + init.len() as u32;
-    let (process, cycles_per_call) = process(layout, kernel)?;
+    let (process, cycles_per_call, network_cycles_per_call) = process(block, layout, kernel)?;
     let set_parameter_start = process_start + process.len() as u32;
     let set_parameter = set_parameter(block, layout)?;
     let recovery_start = set_parameter_start + set_parameter.len() as u32;
     let recovery = recovery(block, layout)?;
     let destroy_start = recovery_start + recovery.len() as u32;
     let destroy = match layout.arena {
-        Some(arena) => destroy(arena, destroy_start, &mut links)?,
+        Some(arena) => destroy(arena, layout.weights(), destroy_start, &mut links)?,
         None => Vec::new(),
     };
     let mut parcels = init;
@@ -134,6 +139,7 @@ pub fn generate(block: &Block, layout: &Layout, kernel: &Kernel) -> Result<Gener
             destroy: layout.arena.map(|_| destroy_start),
         },
         cycles_per_call,
+        network_cycles_per_call,
         kernel_refs: links.kernel_refs,
         relocations: links.relocations,
     })
@@ -282,6 +288,29 @@ fn init(block: &Block, layout: &Layout, start: u32, links: &mut Links) -> Result
                 src: ureg_r(8),
             });
             banks(&mut code, block, layout, 8);
+            if let Some(weights) = layout.weights() {
+                kernels::rings(&mut code, layout);
+                code.push(V::LoadImmediate {
+                    dst: ureg_r(8),
+                    value: weights.bytes(),
+                });
+                heap_call(&mut code, start, HEAP_MALLOC, weights, links)?;
+                code.push(V::Transfer {
+                    dst: ureg_i(SCRATCH_INDEX),
+                    src: ureg_r(4),
+                });
+                code.push(V::StoreDmOffset {
+                    src: ureg_r(0),
+                    index: i(SCRATCH_INDEX),
+                    offset: word(weights.pointer),
+                });
+                code.push(V::IntegerPass {
+                    dst: r(8),
+                    src: r(0),
+                });
+                code.jump(Condition::Eq, "stock");
+                kernels::weights(&mut code, layout);
+            }
             code.label("stock");
         }
     }
@@ -308,6 +337,9 @@ fn recovery(block: &Block, layout: &Layout) -> Result<Vec<u16>> {
                 src: ureg_r(8),
             });
             banks(&mut code, block, layout, 8);
+            if layout.network.is_some() {
+                kernels::rings(&mut code, layout);
+            }
             code.label("return");
         }
     }
@@ -317,8 +349,19 @@ fn recovery(block: &Block, layout: &Layout) -> Result<Vec<u16>> {
 
 /// ctx[8]: free the arena when there is one, then tail-jump to the stock destroy, which frees
 /// the state (R4). The kernel calls destroy only after it has stopped the slot (ABI §3).
-fn destroy(arena: Arena, start: u32, links: &mut Links) -> Result<Vec<u16>> {
+fn destroy(
+    arena: Arena,
+    weights: Option<Arena>,
+    start: u32,
+    links: &mut Links,
+) -> Result<Vec<u16>> {
     let mut code = VisaProgram::new();
+    if let Some(weights) = weights {
+        load_arena(&mut code, weights);
+        code.jump(Condition::Eq, "arena");
+        heap_call(&mut code, start, HEAP_FREE, weights, links)?;
+        code.label("arena");
+    }
     load_arena(&mut code, arena);
     code.jump(Condition::Eq, "stock");
     heap_call(&mut code, start, HEAP_FREE, arena, links)?;
@@ -331,7 +374,12 @@ fn destroy(arena: Arena, start: u32, links: &mut Links) -> Result<Vec<u16>> {
 /// state, or the arena) is in R`base` and I4; uses R0, R1 and I4.
 fn banks(code: &mut VisaProgram, block: &Block, layout: &Layout, base: u8) {
     let bank_words = layout.bank_words;
-    if bank_words == 0 {
+    // A network block zeroes its whole arena: the bank, and the rings that hold history.
+    let zeroed = match (&layout.network, layout.arena) {
+        (Some(_), Some(arena)) => arena.words,
+        _ => bank_words * layout.banks.len() as u32,
+    };
+    if zeroed == 0 {
         return;
     }
     let pointer = i(SCRATCH_INDEX);
@@ -342,7 +390,7 @@ fn banks(code: &mut VisaProgram, block: &Block, layout: &Layout, base: u8) {
     });
     code.push(V::LoadImmediate {
         dst: ureg_r(1),
-        value: bank_words * layout.banks.len() as u32,
+        value: zeroed,
     });
     if layout.banks[0] != 0 {
         code.push(V::ModifyIndex {
@@ -477,6 +525,11 @@ fn step(
     };
     match step {
         Step::Load { source, register } => match source {
+            InputSource::Network => code.push(V::LoadDmOffset {
+                dst: ureg_r(register),
+                index: i(NETWORK_OUTPUT),
+                offset: 0,
+            }),
             InputSource::Audio => code.push(V::LoadDmOffset {
                 dst: ureg_r(register),
                 index: i(AUDIO),
@@ -547,13 +600,22 @@ fn step(
 }
 
 /// Returns the code and a cycle estimate for one call (all channels).
-fn process(layout: &Layout, kernel: &Kernel) -> Result<(Vec<u16>, u64)> {
+fn process(block: &Block, layout: &Layout, kernel: &Kernel) -> Result<(Vec<u16>, u64, u64)> {
     let contract = &kernel.contract;
-    let saved: Vec<UniversalRegister> = SAVED_DATA
-        .iter()
-        .map(|&index| ureg_r(index))
+    let network = block.network.as_ref().filter(|_| layout.network.is_some());
+    // A network sets B registers (writing B also sets I): they are restored first.
+    let saved: Vec<UniversalRegister> = network
+        .into_iter()
+        .flat_map(|_| kernels::saved_b())
+        .chain(SAVED_DATA.iter().map(|&index| ureg_r(index)))
         .chain([ureg_i(STATE), ureg_i(AUDIO), ureg_i(DELAY), ureg_m(DELAY)])
         .chain(layout.arena.map(|_| ureg_i(ARENA)))
+        .chain(network.into_iter().flat_map(|_| {
+            kernels::NETWORK_SAVED
+                .into_iter()
+                .map(ureg_i)
+                .chain(kernels::NETWORK_SAVED_M.into_iter().map(ureg_m))
+        }))
         .collect();
     let mut code = VisaProgram::new();
     code.push(V::ModifyIndex {
@@ -599,12 +661,28 @@ fn process(layout: &Layout, kernel: &Kernel) -> Result<(Vec<u16>, u64)> {
             src: ureg_r(0),
         });
     }
+    if let Some(weights) = layout.weights() {
+        code.push(V::LoadDmOffset {
+            dst: ureg_r(0),
+            index: i(STATE),
+            offset: word(weights.pointer),
+        });
+        code.push(V::IntegerPass {
+            dst: r(0),
+            src: r(0),
+        });
+        code.jump(Condition::Eq, "dry");
+    }
     // Keep the descriptor above SP: sample code can use R8 and I2.
     let descriptor_slot = -2 - saved.len() as i32;
     code.push(V::StoreDmOffset {
         src: ureg_r(8),
         index: i(6),
         offset: descriptor_slot,
+    });
+
+    let network_instructions = network.map_or(0, |network| {
+        kernels::network_phase(&mut code, network, layout, descriptor_slot)
     });
 
     // Hoisted parameter math, once per call for both channels.
@@ -648,6 +726,13 @@ fn process(layout: &Layout, kernel: &Kernel) -> Result<(Vec<u16>, u64)> {
             _ => 0,
         };
         per_sample = per_sample.max(instructions + 4 * delay_setups + 2 + sd);
+        if network.is_some() {
+            code.push(V::ModifyIndex {
+                index: i(NETWORK_OUTPUT),
+                offset: 2,
+            });
+            per_sample += 1;
+        }
         code.push(V::IntegerSubOne {
             dst: r(COUNTER),
             src: r(COUNTER),
@@ -705,10 +790,11 @@ fn process(layout: &Layout, kernel: &Kernel) -> Result<(Vec<u16>, u64)> {
     let channels = layout.banks.len() as u64;
     let cycles = channels * u64::from(BLOCK_SAMPLES) * (per_sample + 8)
         + control_instructions
+        + network_instructions
         + copy_cycles
         + 120
         + layout.arena.map_or(0, |_| 12);
-    Ok((code.parcels()?, cycles))
+    Ok((code.parcels()?, cycles, network_instructions))
 }
 
 /// Store parameter R8 = min + F12 * (max - min). Values outside +0..=1 and indices outside the

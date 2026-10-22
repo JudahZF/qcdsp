@@ -23,6 +23,8 @@ use crate::{
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum InputSource {
     Audio,
+    /// The network output for this sample (IR 3).
+    Network,
     Parameter {
         index: usize,
     },
@@ -120,7 +122,7 @@ pub fn compile_with(block: &Block, available: u16) -> Result<Kernel> {
     for (index, node) in nodes.iter().enumerate() {
         invariant[index] = match node {
             Node::Constant { .. } | Node::Parameter { .. } => true,
-            Node::Input | Node::State { .. } | Node::Delay { .. } => false,
+            Node::Input | Node::Network | Node::State { .. } | Node::Delay { .. } => false,
             _ => node.operands().iter().all(|&operand| invariant[operand]),
         };
     }
@@ -172,6 +174,7 @@ pub fn compile_with(block: &Block, available: u16) -> Result<Kernel> {
             }
             match *node {
                 Node::Input => Some(Source::Load(InputSource::Audio)),
+                Node::Network => Some(Source::Load(InputSource::Network)),
                 Node::Parameter { index } => Some(Source::Load(InputSource::Parameter { index })),
                 Node::State { index } => Some(Source::Load(InputSource::State { index })),
                 Node::Delay { index } => Some(Source::Load(InputSource::Delay { index })),

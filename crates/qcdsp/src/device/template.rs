@@ -49,6 +49,8 @@ pub const HEAP_FREE: u32 = 0x16_ad7e;
 /// Length of heap 0 in bytes (`0x257f8`; the core 2 kernel has the same heaps 0 and 1). A block
 /// whose DM heap figure exceeds it can never fit.
 pub const DM_HEAP_BYTES: u32 = 153_592;
+/// Length of heap 1 (PM, L1 block 2) in bytes (`0x1bff8`).
+pub const PM_HEAP_BYTES: u32 = 114_680;
 /// Length of heap 2, the SD heap, in bytes (`0xfffef8`, base `0x80000000` on core 1 and
 /// `0x81000000` on core 2).
 pub const SD_HEAP_BYTES: u32 = 0xff_fef8;
