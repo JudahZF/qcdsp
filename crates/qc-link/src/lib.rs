@@ -85,8 +85,60 @@ impl KernelMap {
         self.entries.len()
     }
 
+    /// Mappings in ascending core 1 address order.
+    pub fn iter(&self) -> impl Iterator<Item = (u32, [u32; 3])> + '_ {
+        self.entries.iter().map(|(&core1, &others)| (core1, others))
+    }
+
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
+    }
+
+    /// Adds the kernel calls of a stock blob, read from the user's own data: every
+    /// [`KernelForm::Call24`] site in section 2 that has no relocation and whose address field
+    /// a per-core record changes. `diffs` are the blob's records for cores 2, 3 and 4. A core
+    /// whose record leaves the field alone keeps the core 1 address. Sites are found by
+    /// parcel scan, so a misaligned match is possible in principle; a conflicting mapping
+    /// is an error, not an overwrite.
+    pub fn add_stock_calls(&mut self, core1: &ModuleBlob, diffs: &[DiffRecord; 3]) -> Result<()> {
+        let code = core1.content(Section::Code).ok_or(LinkError::MissingCode)?;
+        let relocated: Vec<u32> = core1
+            .relocations
+            .iter()
+            .filter(|group| group.section == Section::Code)
+            .map(|group| group.code_relocations())
+            .collect::<std::result::Result<Vec<_>, _>>()?
+            .into_iter()
+            .flatten()
+            .map(|r| r.offset)
+            .collect();
+        let others = diffs
+            .iter()
+            .map(|diff| diff.apply(core1))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let others: Vec<&[u8]> = others
+            .iter()
+            .map(|blob| blob.content(Section::Code).ok_or(LinkError::MissingCode))
+            .collect::<Result<_>>()?;
+        let parcel = |code: &[u8], p: usize| u16::from_le_bytes([code[2 * p], code[2 * p + 1]]);
+        let address = |code: &[u8], p: usize| {
+            (u32::from(parcel(code, p + 1)) << 16) | u32::from(parcel(code, p + 2))
+        };
+        for p in 0..(code.len() / 2).saturating_sub(2) {
+            if parcel(code, p) != 0x1804
+                || parcel(code, p + 1) >> 8 != 0
+                || relocated.contains(&(p as u32))
+                || others.iter().any(|other| parcel(other, p) != 0x1804)
+            {
+                continue;
+            }
+            let core1_address = address(code, p);
+            let mapped: [u32; 3] = std::array::from_fn(|core| address(others[core], p));
+            if mapped.iter().any(|&other| other != core1_address) {
+                self.insert(core1_address, mapped)?;
+            }
+        }
+        Ok(())
     }
 
     /// Reads the research map format: objects `calls` and `data`, each
@@ -602,6 +654,26 @@ mod tests {
         assert_eq!(linked.diffs[0].contents.len(), 2);
         assert_eq!(linked.diffs[0].relocations.len(), 2);
         assert_eq!(linked.diffs[0].ranges.len(), 2);
+    }
+
+    /// A linked block is a stock-shaped blob with per-core records, so harvesting it gives back
+    /// the CALL mapping. The Rn = imm32 pointer is data, not a call, and is not harvested.
+    #[test]
+    fn stock_calls_round_trip_through_per_core_records() {
+        let linked = link(&input(), &map()).unwrap();
+        let mut harvested = KernelMap::default();
+        harvested
+            .add_stock_calls(&linked.blob, &linked.diffs)
+            .unwrap();
+        assert_eq!(harvested.len(), 1);
+        assert_eq!(harvested.get(CALL), map().get(CALL));
+
+        let mut conflicting = KernelMap::default();
+        conflicting.insert(CALL, [CALL + 1; 3]).unwrap();
+        assert!(matches!(
+            conflicting.add_stock_calls(&linked.blob, &linked.diffs),
+            Err(LinkError::KernelMap(_))
+        ));
     }
 
     #[test]
