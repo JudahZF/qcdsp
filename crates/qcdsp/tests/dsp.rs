@@ -447,7 +447,11 @@ fn ir2_approximations_stay_within_their_documented_error() {
     for step in -40_000..=40_000 {
         let x = step as f32 * 2.5e-4;
         let t = tanh.process_sample(x * 3.0);
-        assert!((t - (x * 3.0).tanh()).abs() <= 1e-4, "tanh({}) = {t}", x * 3.0);
+        assert!(
+            (t - (x * 3.0).tanh()).abs() <= 1e-4,
+            "tanh({}) = {t}",
+            x * 3.0
+        );
         let s = sigmoid.process_sample(x * 3.0);
         let exact = 1.0 / (1.0 + (-x * 3.0).exp());
         assert!((s - exact).abs() <= 5e-5, "sigmoid({}) = {s}", x * 3.0);
@@ -455,7 +459,10 @@ fn ir2_approximations_stay_within_their_documented_error() {
     // Saturates and never leaves [-1, 1], even for huge inputs.
     for x in [5.0_f32, 50.0, 1e30, -1e30] {
         let t = tanh.process_sample(x);
-        assert!(t.abs() <= 1.0 && (t - x.signum()).abs() <= 1e-4, "tanh({x}) = {t}");
+        assert!(
+            t.abs() <= 1.0 && (t - x.signum()).abs() <= 1e-4,
+            "tanh({x}) = {t}"
+        );
     }
     for exponent in -36..=36 {
         for mantissa in [1.0_f32, 1.37, 2.9, 7.5] {
@@ -479,10 +486,16 @@ fn ir_version_is_the_oldest_that_holds_the_block() {
     assert_eq!(decoded.channels(), Channels::Mono);
     // An IR 1 reader of the same graph must not accept IR 2 features.
     let downgraded = json.replace("\"version\": 2", "\"version\": 1");
-    assert!(matches!(Block::from_json(&downgraded), Err(Error::Invalid(_))));
+    assert!(matches!(
+        Block::from_json(&downgraded),
+        Err(Error::Invalid(_))
+    ));
     let stereo = json.replace("\"channels\": \"mono\",", "");
     let stereo_v1 = stereo.replace("\"version\": 2", "\"version\": 1");
-    assert!(matches!(Block::from_json(&stereo_v1), Err(Error::Invalid(_))));
+    assert!(matches!(
+        Block::from_json(&stereo_v1),
+        Err(Error::Invalid(_))
+    ));
     assert!(Block::from_json(&json.replace("\"version\": 2", "\"version\": 3")).is_err());
 }
 
@@ -497,7 +510,10 @@ fn saturator_matches_its_formula_and_hoists_parameter_math() {
         let x = step as f32 * 0.01;
         let expected = 0.8 * ((12.0 * x + 0.2).tanh() - 0.2_f32.tanh()) / 12.0_f32.tanh();
         let actual = processor.process_sample(x);
-        assert!((actual - expected).abs() <= 3e-4, "{x}: {actual} vs {expected}");
+        assert!(
+            (actual - expected).abs() <= 3e-4,
+            "{x}: {actual} vs {expected}"
+        );
     }
     // tanh(bias), tanh(drive) and its reciprocal depend only on parameters.
     let kernel = codegen::compile(&block).unwrap();
@@ -509,5 +525,8 @@ fn saturator_matches_its_formula_and_hoists_parameter_math() {
         .filter(|step| matches!(step, Step::Compute { .. }))
         .count();
     let all = kernel.contract.control.len() + kernel.contract.sample.len();
-    assert!(sample_computes * 2 < all, "{sample_computes} of {all} steps run per sample");
+    assert!(
+        sample_computes * 2 < all,
+        "{sample_computes} of {all} steps run per sample"
+    );
 }

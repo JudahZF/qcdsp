@@ -707,8 +707,7 @@ impl BlockBuilder {
     pub fn finish(mut self, output: Signal) -> Result<Block> {
         self.block.output = self.check(output)?;
         // Write the oldest IR version that holds the block, so older readers accept it.
-        if self.block.channels != Channels::Stereo || self.block.nodes.iter().any(Node::needs_ir2)
-        {
+        if self.block.channels != Channels::Stereo || self.block.nodes.iter().any(Node::needs_ir2) {
             self.block.version = 2;
         }
         self.block.validate()?;

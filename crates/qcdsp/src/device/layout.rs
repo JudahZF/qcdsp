@@ -59,7 +59,9 @@ impl Layout {
         Ok(Self {
             parameters,
             controls,
-            banks: (0..channels).map(|channel| first + channel * bank_words).collect(),
+            banks: (0..channels)
+                .map(|channel| first + channel * bank_words)
+                .collect(),
             bank_words,
             states: 0,
             cursors: state_count,
