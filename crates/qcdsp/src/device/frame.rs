@@ -23,7 +23,7 @@
 //! term, and an `add` into the output is added before the store. The sums keep the host's order.
 
 use super::template::BLOCK_SAMPLES;
-use crate::network::{Network, Op};
+use crate::network::{Activation, Network, Op};
 
 /// Rows of one call.
 const ROWS: u32 = BLOCK_SAMPLES;
@@ -61,6 +61,8 @@ pub struct FramePlan {
     pub weights: Vec<f32>,
     /// The kernels in program order; together they run every operation once.
     pub kernels: Vec<Kernel>,
+    /// Word offset in `weights` of the tanh constants ([`TANH_CONSTANTS`], each twice).
+    pub tanh_constants: Option<u32>,
     /// Buffers with a ring, in buffer order; each has a cursor word in the state.
     pub rings: Vec<usize>,
 }
@@ -106,12 +108,21 @@ impl FramePlan {
             .collect();
         let mut weights = Vec::new();
         let kernels = kernels(network, &mut weights);
+        let tanh_constants = kernels
+            .iter()
+            .any(|kernel| matches!(kernel, Kernel::Tanh { .. }))
+            .then(|| {
+                let at = weights.len() as u32;
+                weights.extend(TANH_CONSTANTS.iter().flat_map(|&c| [c, c]));
+                at
+            });
         Self {
             rings: (0..history.len()).filter(|&b| history[b] > 0).collect(),
             buffers,
             dm_words: offset,
             weights,
             kernels,
+            tanh_constants,
         }
     }
 
@@ -145,10 +156,31 @@ fn live_ranges(network: &Network) -> Vec<(usize, usize)> {
     live
 }
 
+/// The constants of the tanh kernel in the order it loads them: the clamp, then the Padé
+/// numerator and denominator coefficients, the reciprocal seed and Newton's 2.
+pub const TANH_CONSTANTS: [f32; 10] = [
+    -crate::graph::TANH_LIMIT,
+    crate::graph::TANH_LIMIT,
+    28.0,
+    378.0,
+    3150.0,
+    17325.0,
+    62370.0,
+    135_135.0,
+    f32::from_bits(crate::graph::RECIP_MAGIC),
+    2.0,
+];
+
 /// What the code generator runs.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Kernel {
     Conv(ConvKernel),
+    /// A tanh activation, with the `add` (head sum) or `copy` of its result that follows it:
+    /// `(the other buffer, true for a copy)`.
+    Tanh {
+        op: usize,
+        sum: Option<(usize, bool)>,
+    },
     /// An operation that runs alone (elementwise).
     Op(usize),
 }
@@ -184,6 +216,24 @@ fn kernels(network: &Network, packed: &mut Vec<f32>) -> Vec<Kernel> {
     let mut kernels = Vec::new();
     let mut at = 0;
     while at < ops.len() {
+        if let Op::Activation {
+            buffer,
+            function: Activation::Tanh,
+        } = &ops[at]
+        {
+            let sum = match ops.get(at + 1) {
+                Some(Op::Add { input, output }) if input == buffer && output != buffer => {
+                    Some((*output, false))
+                }
+                Some(Op::Copy { input, output }) if input == buffer && output != buffer => {
+                    Some((*output, true))
+                }
+                _ => None,
+            };
+            kernels.push(Kernel::Tanh { op: at, sum });
+            at += 1 + usize::from(sum.is_some());
+            continue;
+        }
         let Op::Conv {
             input,
             output,

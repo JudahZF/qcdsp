@@ -23,7 +23,7 @@ use qc_asm::{
 
 use super::{
     emit::{ARENA, SCRATCH_INDEX, STATE, i, m, r, ureg_i, ureg_m, ureg_r, word},
-    frame::{ConvKernel, FrameBuffer, Kernel},
+    frame::{ConvKernel, FrameBuffer, Kernel, TANH_CONSTANTS},
     layout::{Layout, NetworkLayout},
     template::BLOCK_SAMPLES,
 };
@@ -198,6 +198,14 @@ pub(super) fn network_phase(
         let op = match kernel {
             Kernel::Conv(conv_kernel) => {
                 looped += conv(code, network, net, conv_kernel, weights);
+                continue;
+            }
+            Kernel::Tanh { op, sum } => {
+                let Op::Activation { buffer, .. } = &network.ops[*op] else {
+                    unreachable!("a tanh kernel runs an activation")
+                };
+                let constants = net.plan.tanh_constants.expect("tanh constants are planned");
+                looped += tanh(code, net, *buffer, *sum, weights, constants);
                 continue;
             }
             Kernel::Op(op) => &network.ops[*op],
@@ -539,6 +547,233 @@ fn row_pair(code: &mut VisaProgram, n: usize, taps: usize, terms: usize, residua
             }
         };
         previous = Some((access.index.index(), at));
+    }
+    for slot in slots {
+        if let Some(instruction) = instruction(slot.compute, slot.dm, slot.pm) {
+            code.push(instruction);
+        }
+    }
+}
+
+/// The steps of tanh for one element (see [`crate::network::tanh`]), on the registers of one
+/// element group: `(op, destination, left, right)` with a register as `Ok(offset)` from the
+/// group's base or a constant as `Err(index in TANH_CONSTANTS)`.
+type Operand = std::result::Result<u8, usize>;
+const TANH_STEPS: [(TanhOp, u8, Operand, Operand); 23] = {
+    use TanhOp::{Add, Max, Min, Mul, Seed, Sub};
+    const X: u8 = 0;
+    const X2: u8 = 1;
+    const NUM: u8 = 2;
+    const DEN: u8 = 3;
+    const EST: u8 = 4;
+    const TMP: u8 = 5;
+    [
+        (Max, X, Ok(X), Err(0)),
+        (Min, X, Ok(X), Err(1)),
+        (Mul, X2, Ok(X), Ok(X)),
+        (Mul, DEN, Ok(X2), Err(2)),
+        (Add, NUM, Ok(X2), Err(3)),
+        (Add, DEN, Ok(DEN), Err(4)),
+        (Mul, NUM, Ok(X2), Ok(NUM)),
+        (Mul, DEN, Ok(X2), Ok(DEN)),
+        (Add, NUM, Ok(NUM), Err(5)),
+        (Add, DEN, Ok(DEN), Err(6)),
+        (Mul, NUM, Ok(X2), Ok(NUM)),
+        (Mul, DEN, Ok(X2), Ok(DEN)),
+        (Add, NUM, Ok(NUM), Err(7)),
+        (Add, DEN, Ok(DEN), Err(7)),
+        (Mul, NUM, Ok(X), Ok(NUM)),
+        (Seed, EST, Err(8), Ok(DEN)),
+        (Mul, TMP, Ok(DEN), Ok(EST)),
+        (Sub, TMP, Err(9), Ok(TMP)),
+        (Mul, EST, Ok(EST), Ok(TMP)),
+        (Mul, TMP, Ok(DEN), Ok(EST)),
+        (Sub, TMP, Err(9), Ok(TMP)),
+        (Mul, EST, Ok(EST), Ok(TMP)),
+        (Mul, X, Ok(NUM), Ok(EST)),
+    ]
+};
+
+#[derive(Clone, Copy)]
+enum TanhOp {
+    Max,
+    Min,
+    Mul,
+    Add,
+    Sub,
+    /// The reciprocal seed: an integer subtraction of the bit patterns.
+    Seed,
+}
+
+/// Tanh over a buffer, two element pairs (four values) at a time: group A (F0-F5) and group B
+/// (F6-F11) alternate step by step, so no step uses the result of the instruction before it.
+/// The constants come from a table in the weights arena (I11), each into F12 or F13 just before
+/// its first use. A fused head sum adds each result to `sum` (F1 and F7, free by then) or
+/// copies it there.
+fn tanh(
+    code: &mut VisaProgram,
+    net: &NetworkLayout,
+    buffer: usize,
+    sum: Option<(usize, bool)>,
+    weights_pointer: u32,
+    constants: u32,
+) -> u64 {
+    point(code, net, SRC, buffer);
+    point(code, net, OUT, buffer);
+    if let Some((other, copy)) = sum {
+        // The sum is read through I4 (DM) and written through I10 (PM bus).
+        if !copy {
+            point(code, net, SCRATCH_INDEX, other);
+        }
+        point(code, net, OPERAND, other);
+    }
+    code.push(V::LoadDmOffset {
+        dst: ureg_i(BIAS),
+        index: i(STATE),
+        offset: word(weights_pointer),
+    });
+    code.push(V::ModifyIndex {
+        index: i(BIAS),
+        offset: word(constants),
+    });
+    set(code, ureg_m(3), 2);
+    set(code, ureg_m(8), 2);
+    set(code, ureg_m(9), -2 * (TANH_CONSTANTS.len() as i32 - 1));
+    simd(code, true, MODE1_PEYEN);
+    let iterations = BLOCK_SAMPLES * padded(&net.plan.buffers[buffer]) / 4;
+    let looped = loop_cost(code, iterations, |code| tanh_body(code, sum));
+    simd(code, false, MODE1_PEYEN);
+    looped
+}
+
+fn tanh_body(code: &mut VisaProgram, sum: Option<(usize, bool)>) {
+    const B: u8 = 6;
+    let constant = |index: usize| 12 + (index % 2) as u8;
+    // Slot 0 loads; then A_k at 1 + 2k and B_k at 2 + 2k; then the sum adds, then stores.
+    let mut slots: Vec<Slot> = vec![Slot::default()];
+    for &(op, dst, lhs, rhs) in &TANH_STEPS {
+        for base in [0, B] {
+            let operand = |o: Operand| r(o.map_or_else(constant, |o| base + o));
+            let (dst, lhs, rhs) = (r(base + dst), operand(lhs), operand(rhs));
+            let instruction = match op {
+                TanhOp::Max => Instruction::FloatMax { dst, lhs, rhs },
+                TanhOp::Min => Instruction::FloatMin { dst, lhs, rhs },
+                TanhOp::Mul => Instruction::FloatMul { dst, lhs, rhs },
+                TanhOp::Add => Instruction::FloatAdd { dst, lhs, rhs },
+                TanhOp::Sub => Instruction::FloatSub { dst, lhs, rhs },
+                TanhOp::Seed => Instruction::IntegerSub { dst, lhs, rhs },
+            };
+            slots.push(Slot {
+                compute: Some(single(instruction)),
+                ..Slot::default()
+            });
+        }
+    }
+    let last = slots.len() - 1; // B_22
+    let mut add_at = [0; 2];
+    if let Some((_, false)) = sum {
+        for (n, base) in [0, B].into_iter().enumerate() {
+            add_at[n] = slots.len();
+            slots.push(Slot {
+                compute: Some(single(Instruction::FloatAdd {
+                    dst: r(base + 1),
+                    lhs: r(base + 1),
+                    rhs: r(base),
+                })),
+                ..Slot::default()
+            });
+        }
+    }
+    // (access, PM bus?, earliest slot, first slot that must see it or the end).
+    let step = |k: usize, base: u8| 1 + 2 * k + usize::from(base == B);
+    let mut memory: Vec<(DataAccess, bool, usize, usize)> = vec![
+        (load(0, SRC, 3), false, 0, step(0, 0)),
+        (load(B, SRC, 3), false, 0, step(0, B)),
+    ];
+    // Each constant after the last use of its register's previous constant.
+    let first_use = |index: usize| {
+        TANH_STEPS
+            .iter()
+            .position(|&(_, _, l, r)| l == Err(index) || r == Err(index))
+            .expect("every constant is used")
+    };
+    let last_use = |index: usize| {
+        TANH_STEPS
+            .iter()
+            .rposition(|&(_, _, l, r)| l == Err(index) || r == Err(index))
+            .expect("every constant is used")
+    };
+    for index in 0..TANH_CONSTANTS.len() {
+        let modifier = if index == TANH_CONSTANTS.len() - 1 {
+            9
+        } else {
+            8
+        };
+        let earliest = if index < 2 {
+            0
+        } else {
+            step(last_use(index - 2), B)
+        };
+        memory.push((
+            load(constant(index), BIAS, modifier),
+            true,
+            earliest,
+            step(first_use(index), 0),
+        ));
+    }
+    let end = usize::MAX;
+    memory.push((store(0, OUT, 3), false, step(22, 0) + 1, end));
+    memory.push((store(B, OUT, 3), false, last + 1, end));
+    match sum {
+        Some((_, false)) => {
+            // F1 and F7 (x²) are free after step 11.
+            memory.push((load(1, SCRATCH_INDEX, 3), false, step(11, 0) + 1, add_at[0]));
+            memory.push((store(1, OPERAND, 8), true, add_at[0] + 1, end));
+            memory.push((
+                load(B + 1, SCRATCH_INDEX, 3),
+                false,
+                step(11, B) + 1,
+                add_at[1],
+            ));
+            memory.push((store(B + 1, OPERAND, 8), true, add_at[1] + 1, end));
+        }
+        Some((_, true)) => {
+            memory.push((store(0, OPERAND, 8), true, step(22, 0) + 1, end));
+            memory.push((store(B, OPERAND, 8), true, last + 1, end));
+        }
+        None => {}
+    }
+    // In order, each in the first free slot of its bus in its window (accesses through one
+    // pointer keep their order), else in a new slot at the end.
+    let mut after: Vec<(u8, usize)> = Vec::new();
+    for (access, pm, earliest, before) in memory {
+        let index = access.index.index();
+        let start = after
+            .iter()
+            .filter(|(i, _)| *i == index)
+            .map(|(_, at)| at + 1)
+            .fold(earliest, usize::max);
+        let free = |slot: &Slot| {
+            if pm {
+                slot.pm.is_none()
+            } else {
+                slot.dm.is_none()
+            }
+        };
+        let at = match (start..before.min(slots.len())).find(|&at| free(&slots[at])) {
+            Some(at) => at,
+            None => {
+                assert_eq!(before, end, "a load always finds a slot before its user");
+                slots.push(Slot::default());
+                slots.len() - 1
+            }
+        };
+        if pm {
+            slots[at].pm = Some(access);
+        } else {
+            slots[at].dm = Some(access);
+        }
+        after.push((index, at));
     }
     for slot in slots {
         if let Some(instruction) = instruction(slot.compute, slot.dm, slot.pm) {
