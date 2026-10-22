@@ -369,6 +369,10 @@ impl Block {
     pub fn version(&self) -> u32 {
         self.version
     }
+    /// The number of nodes; [`Block::expanded`] gives the count that compilation sees.
+    pub fn node_count(&self) -> usize {
+        self.nodes.len()
+    }
 
     /// The same graph under another identity. A host that installs blocks from many
     /// sources gives each one a unique blob name and its own display name.
