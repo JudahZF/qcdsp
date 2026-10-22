@@ -451,6 +451,16 @@ impl VisaProgram {
         });
     }
 
+    /// Instructions, jumps included; labels are not instructions. A SHARC+ core issues one
+    /// instruction per cycle whatever its parcel width, so this (not the parcel count) is
+    /// the base of a cycle estimate.
+    pub fn instruction_count(&self) -> usize {
+        self.items
+            .iter()
+            .filter(|item| !matches!(item, Item::Label(_)))
+            .count()
+    }
+
     /// Resolves labels and returns parcels in execution order. Labels emit nothing.
     pub fn parcels(&self) -> Result<Vec<u16>, VisaError> {
         let mut labels = HashMap::new();

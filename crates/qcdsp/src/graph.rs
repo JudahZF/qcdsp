@@ -272,17 +272,21 @@ impl Expander {
     /// Valid for normal `|x|` in about 1e-37..1e37; outside it the result can be
     /// infinite or NaN, which faults the block's DSP slot.
     fn recip(&mut self, input: usize) -> usize {
+        self.recip_steps(input, RECIP_NEWTON_STEPS)
+    }
+    fn recip_steps(&mut self, input: usize, steps: usize) -> usize {
         let magic = self.constant(f32::from_bits(RECIP_MAGIC));
         let two = self.constant(2.0);
         let mut estimate = self.binary(BinaryOp::SubBits, magic, input);
-        for _ in 0..RECIP_NEWTON_STEPS {
+        for _ in 0..steps {
             let product = self.binary(BinaryOp::Mul, input, estimate);
             let correction = self.binary(BinaryOp::Sub, two, product);
             estimate = self.binary(BinaryOp::Mul, correction, estimate);
         }
         estimate
     }
-    /// Within 1e-4 of tanh everywhere.
+    /// Within 1e-4 of tanh everywhere. The clamped input keeps `|result|` below 1 - 6e-6, so
+    /// the result needs no clamp; two Newton steps (relative error 7e-6) suffice for it.
     fn tanh(&mut self, input: usize) -> usize {
         let x = self.clamp(input, TANH_LIMIT);
         let x2 = self.binary(BinaryOp::Mul, x, x);
@@ -296,9 +300,8 @@ impl Expander {
         let denominator = self.mul_add(3150.0, x2, denominator);
         let denominator = self.mul_add(62370.0, x2, denominator);
         let denominator = self.mul_add(135_135.0, x2, denominator);
-        let inverse = self.recip(denominator);
-        let ratio = self.binary(BinaryOp::Mul, numerator, inverse);
-        self.clamp(ratio, 1.0)
+        let inverse = self.recip_steps(denominator, 2);
+        self.binary(BinaryOp::Mul, numerator, inverse)
     }
     /// `0.5 + 0.5 tanh(x / 2)`.
     fn sigmoid(&mut self, input: usize) -> usize {

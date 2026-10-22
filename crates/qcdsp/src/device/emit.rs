@@ -365,11 +365,11 @@ fn process(layout: &Layout, kernel: &Kernel) -> Result<(Vec<u16>, u64)> {
     });
 
     // Hoisted parameter math, once per call for both channels.
-    let before = code.parcels()?.len();
+    let before = code.instruction_count();
     for &control in &contract.control {
         step(&mut code, kernel, layout, None, control);
     }
-    let control_parcels = (code.parcels()?.len() - before) as u64;
+    let control_instructions = (code.instruction_count() - before) as u64;
 
     let mut per_sample = 0;
     for (channel, &bank) in layout.banks.iter().enumerate() {
@@ -389,15 +389,16 @@ fn process(layout: &Layout, kernel: &Kernel) -> Result<(Vec<u16>, u64)> {
             value: BLOCK_SAMPLES,
         });
         code.label(&top);
-        let before = code.parcels()?.len();
+        let before = code.instruction_count();
         let mut delay_setups = 0;
         for &sample in &contract.sample {
             delay_setups += step(&mut code, kernel, layout, Some((channel, bank)), sample);
         }
-        // Parcels over-count instructions; add the SHARC+ DAG load-to-use stalls
-        // (4 cycles) for each delay pointer setup.
-        let parcels = (code.parcels()?.len() - before) as u64;
-        per_sample = per_sample.max(parcels + 4 * delay_setups + 2);
+        // One cycle per instruction, plus the SHARC+ DAG load-to-use stalls (4 cycles) of each
+        // delay pointer setup. The catalogue entry doubles the result (`metadata::CPU_SAFETY`)
+        // until a measurement on the unit replaces this model.
+        let instructions = (code.instruction_count() - before) as u64;
+        per_sample = per_sample.max(instructions + 4 * delay_setups + 2);
         code.push(V::IntegerSubOne {
             dst: r(COUNTER),
             src: r(COUNTER),
@@ -450,7 +451,7 @@ fn process(layout: &Layout, kernel: &Kernel) -> Result<(Vec<u16>, u64)> {
     // control phase, the mono copy, and a fixed allowance for frame setup, saves and restores.
     let channels = layout.banks.len() as u64;
     let cycles = channels * u64::from(BLOCK_SAMPLES) * (per_sample + 8)
-        + control_parcels
+        + control_instructions
         + copy_cycles
         + 120;
     Ok((code.parcels()?, cycles))

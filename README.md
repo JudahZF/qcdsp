@@ -32,7 +32,7 @@ qcdsp does not depend on Tetrad. Tetrad's `tetrad-sharc` tests use the `qcdsp` c
 - All eight example blocks compile to installable stages. They run correctly on Tetrad's `tetrad-sharc` machine with PRM arithmetic.
 - The `Gain` example (model id 16901) loaded in a preset on a unit. It was then uninstalled to restore stock Cortex Control compatibility. Its audio output is not tested.
 - The other examples have not been installed on a unit.
-- CPU figures are estimates, not measurements.
+- CPU figures are estimates, not measurements: one cycle per instruction plus modelled DAG stalls, doubled in the catalogue entry.
 
 `docs/abi-status.md` lists the open items.
 
@@ -61,7 +61,7 @@ Operations: input, parameter, constant, state, delay tap, add, subtract, multipl
 
 IR version 2 adds:
 
-- `div`, `recip`, `tanh` and `sigmoid`. They expand to the operations above before compilation (`Block::expanded`), so the host reference and the device compute the same thing. `recip` is a bit-pattern seed and three Newton steps: relative error about 2^-22 for normal `|x|` in about 1e-37..1e37. Outside that range the result can be infinite or NaN, which faults the block's DSP slot. `tanh` is a clamped Padé (7, 6) approximation within 1e-4 of tanh; `sigmoid(x)` is `0.5 + 0.5 tanh(x / 2)`.
+- `div`, `recip`, `tanh` and `sigmoid`. They expand to the operations above before compilation (`Block::expanded`), so the host reference and the device compute the same thing. `recip` is a bit-pattern seed and three Newton steps: relative error about 2^-22 for normal `|x|` in about 1e-37..1e37. Outside that range the result can be infinite or NaN, which faults the block's DSP slot. `tanh` is a Padé (7, 6) approximation of the clamped input, within 1e-4 of tanh and always inside (-1, 1); `sigmoid(x)` is `0.5 + 0.5 tanh(x / 2)`.
 - `sub_bits`: integer subtraction of two bit patterns (the reciprocal seed).
 - `"channels": "mono"` (`BlockBuilder::mono`): the block computes channel A only and writes the result to both channels, at half the cost.
 
