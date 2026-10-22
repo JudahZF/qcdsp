@@ -482,6 +482,19 @@ impl VisaProgram {
             .count()
     }
 
+    /// Parcels emitted so far. Labels are not resolved (a jump is always three parcels), so
+    /// this works while a forward label is still undefined.
+    pub fn parcel_count(&self) -> Result<usize, VisaError> {
+        self.items
+            .iter()
+            .map(|item| match item {
+                Item::Instruction(instruction) => instruction.parcels().map(|p| p.len()),
+                Item::Label(_) => Ok(0),
+                Item::Jump { .. } => Ok(3),
+            })
+            .sum()
+    }
+
     /// Resolves labels and returns parcels in execution order. Labels emit nothing.
     pub fn parcels(&self) -> Result<Vec<u16>, VisaError> {
         let mut labels = HashMap::new();

@@ -524,6 +524,8 @@ fn mixed_width_labels_use_branch_start_and_parcel_units() {
         src: r(0),
     }); // 3
     program.jump(Condition::Ne, "loop"); // parcel 8; target 0: -8
+    // "done" is still undefined: the count does not resolve labels.
+    assert_eq!(program.parcel_count().unwrap(), 11);
     program.label("done"); // parcel 11
     program.push(VisaInstruction::LeafReturn); // 6 parcels (not 4 instructions)
     let expected = [
