@@ -20,14 +20,21 @@ pub struct Resources {
 }
 
 impl Resources {
+    /// The DM heap the kernel charges: Volume's own figure with its state allocation replaced
+    /// by the generated one. `heap_malloc` (k1 `0x16adfa`) takes `(bytes + 11) & !7` per
+    /// allocation (an 8-byte header, rounded to 8 bytes).
     pub fn dm_heap(&self) -> u32 {
-        STOCK_DM_HEAP - STOCK_STATE_BYTES + self.state_bytes
+        STOCK_DM_HEAP - heap_charge(STOCK_STATE_BYTES) + heap_charge(self.state_bytes)
     }
 
     pub fn cpu(&self) -> f64 {
         let generated = self.cycles_per_call as f64 / CYCLES_PER_BLOCK * 100.0 * CPU_SAFETY;
         ((STOCK_CPU + generated) * 1000.0).ceil() / 1000.0
     }
+}
+
+fn heap_charge(bytes: u32) -> u32 {
+    (bytes + 11) & !7
 }
 
 fn number(value: f32) -> String {
@@ -98,4 +105,27 @@ pub fn module_element(
     }
     xml.push_str("</Module>");
     Ok(xml)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Volume's own state (0x44 bytes) gives its stock figure; an even word count is charged
+    /// 8 bytes of header and rounding, an odd one 4.
+    #[test]
+    fn dm_heap_follows_the_kernel_allocator() {
+        let heap = |state_bytes| {
+            Resources {
+                code_bytes: 0,
+                state_bytes,
+                cycles_per_call: 0,
+            }
+            .dm_heap()
+        };
+        assert_eq!(heap(STOCK_STATE_BYTES), STOCK_DM_HEAP);
+        assert_eq!(heap(64), 136 + 72);
+        assert_eq!(heap(68), 136 + 72);
+        assert_eq!(heap(72), 136 + 80);
+    }
 }
