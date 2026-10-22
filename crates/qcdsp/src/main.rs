@@ -30,6 +30,13 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Write a block's `.qcdsp.json` graph (for a Tetrad extension package, or to edit).
+    Export {
+        #[command(flatten)]
+        source: Source,
+        #[arg(short, long)]
+        output: PathBuf,
+    },
     /// Compile a block into an encrypted, installable stage for this device.
     /// Reads the user's own firmware copy; writes only the new stage directory.
     Build {
@@ -273,6 +280,7 @@ enum Example {
     EnvelopeFilter,
     MicroSynth,
     BassMicroSynth,
+    Saturator,
 }
 
 impl Source {
@@ -291,6 +299,7 @@ impl Source {
             Example::EnvelopeFilter => examples::envelope_filter()?,
             Example::MicroSynth => examples::micro_synth(examples::Voicing::Guitar)?,
             Example::BassMicroSynth => examples::micro_synth(examples::Voicing::Bass)?,
+            Example::Saturator => examples::saturator()?,
         })
     }
 }
@@ -397,6 +406,10 @@ fn run() -> Result<(), Box<dyn Error>> {
         arguments.remove(1);
     }
     match Cli::parse_from(arguments).command {
+        Command::Export { source, output } => {
+            fs::write(&output, source.load()?.to_json()?)?;
+            println!("wrote {}", output.display());
+        }
         Command::Build {
             source,
             device: args,

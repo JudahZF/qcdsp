@@ -67,6 +67,8 @@ IR version 2 adds:
 
 `BlockBuilder::finish` writes the oldest version that holds the block, so a block without these features stays version 1.
 
+`cargo qcdsp export --example saturator --output saturator.qcdsp.json` writes an example's graph (or `--block <file>` re-validates one), for example for a Tetrad extension package.
+
 `qcdsp::examples` has these blocks: gain, biquad, a mono `tanh` saturator (IR 2), feedback delay, soft clipper, sine tremolo, envelope filter, and models of the Electro-Harmonix Micro Synthesizer and Bass Micro Synthesizer (`examples::micro_synth`). `crates/qcdsp/src/examples/kit.rs` has the shared parts: one-pole filters, an envelope follower, a state-variable filter and a `2^x` approximation for exponential tapers.
 
 Rules:
