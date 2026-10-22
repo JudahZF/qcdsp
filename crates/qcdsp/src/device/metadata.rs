@@ -2,7 +2,10 @@
 
 use qc_format::metadata::escape;
 
-use super::template::{DM_HEAP_BYTES, STOCK_CPU, STOCK_DM_HEAP, STOCK_STATE_BYTES};
+use super::{
+    layout::Arena,
+    template::{DM_HEAP_BYTES, STOCK_CPU, STOCK_DM_HEAP, STOCK_STATE_BYTES},
+};
 use crate::{Block, Error, Result};
 
 /// Cycles available to one core for a 32-sample block at 48 kHz on a 450 MHz
@@ -15,26 +18,25 @@ const SW_PAD: usize = 256;
 
 pub struct Resources {
     pub code_bytes: usize,
+    /// Volume's state allocation; an arena is separate ([`super::Layout::arena`]).
     pub state_bytes: u32,
-    /// Bytes of the heap-0 arena, when the block has one.
-    pub arena_bytes: Option<u32>,
     pub cycles_per_call: u64,
 }
 
 impl Resources {
     /// The DM heap the kernel charges: Volume's own figure with its state allocation replaced
-    /// by the generated one, plus the arena (heap 0). `heap_malloc` (k1 `0x16adfa`) takes
-    /// `(bytes + 11) & !7` per allocation (an 8-byte header, rounded to 8 bytes).
-    pub fn dm_heap(&self) -> u32 {
+    /// by the generated one, plus the block's heap-0 arena. `heap_malloc` (k1 `0x16adfa`)
+    /// takes `(bytes + 11) & !7` per allocation (an 8-byte header, rounded to 8 bytes).
+    pub fn dm_heap(&self, arena: Option<Arena>) -> u32 {
         STOCK_DM_HEAP - heap_charge(STOCK_STATE_BYTES)
             + heap_charge(self.state_bytes)
-            + self.arena_bytes.map_or(0, heap_charge)
+            + arena.map_or(0, |arena| heap_charge(arena.bytes()))
     }
 
     /// Refuses a block whose DM heap figure exceeds heap 0 itself: no layout could place it.
     /// Smaller figures are for ZenUI's fit (with every other block on the core) to decide.
-    pub fn check_heaps(&self) -> Result<()> {
-        let heap = self.dm_heap();
+    pub fn check_heaps(&self, arena: Option<Arena>) -> Result<()> {
+        let heap = self.dm_heap(arena);
         if heap > DM_HEAP_BYTES {
             return Err(Error::Invalid(format!(
                 "the block needs {heap} bytes of DM heap; heap 0 has {DM_HEAP_BYTES}"
@@ -96,12 +98,14 @@ pub fn module_element(
     resources: &Resources,
 ) -> Result<String> {
     let cpu = resources.cpu();
+    // The arena follows from the block's layout, as in `device::build`.
+    let (layout, _) = super::generate(block)?;
     let mut xml = format!(
         r#"<Module name="{}" blob_name="{}" id="{model_id}" category="{}" dm_heap="{}" pm_heap="0" sd_heap="0" dma="0" pm="0" dm="32" sw="{}" sw_pad="{SW_PAD}" nw="0" cpu_pad="0.4" Latency="0">"#,
         escape(display_name)?,
         escape(blob_name)?,
         block.category().id(),
-        resources.dm_heap(),
+        resources.dm_heap(layout.arena),
         resources.code_bytes + SW_PAD,
     );
     for test in [
@@ -131,32 +135,39 @@ mod tests {
     /// 8 bytes of header and rounding, an odd one 4.
     #[test]
     fn dm_heap_follows_the_kernel_allocator() {
-        let heap = |state_bytes| resources(state_bytes, None).dm_heap();
+        let heap = |state_bytes| resources(state_bytes).dm_heap(None);
         assert_eq!(heap(STOCK_STATE_BYTES), STOCK_DM_HEAP);
         assert_eq!(heap(64), 136 + 72);
         assert_eq!(heap(68), 136 + 72);
         assert_eq!(heap(72), 136 + 80);
     }
 
-    fn resources(state_bytes: u32, arena_bytes: Option<u32>) -> Resources {
+    fn resources(state_bytes: u32) -> Resources {
         Resources {
             code_bytes: 0,
             state_bytes,
-            arena_bytes,
             cycles_per_call: 0,
         }
+    }
+
+    fn arena(bytes: u32) -> Option<Arena> {
+        Some(Arena {
+            pointer: 17,
+            words: bytes / 4,
+        })
     }
 
     /// An arena is a second heap-0 allocation with its own header and rounding, and the
     /// figure may not exceed heap 0.
     #[test]
     fn arena_is_charged_to_the_dm_heap_up_to_its_size() {
-        let state = resources(72, None).dm_heap();
-        assert_eq!(resources(72, Some(72_008)).dm_heap(), state + 72_016);
-        assert_eq!(resources(72, Some(72_012)).dm_heap(), state + 72_016);
-        assert_eq!(resources(72, Some(72_016)).dm_heap(), state + 72_024);
+        let r = resources(72);
+        let state = r.dm_heap(None);
+        assert_eq!(r.dm_heap(arena(72_008)), state + 72_016);
+        assert_eq!(r.dm_heap(arena(72_012)), state + 72_016);
+        assert_eq!(r.dm_heap(arena(72_016)), state + 72_024);
         let budget = DM_HEAP_BYTES - state - 8;
-        assert!(resources(72, Some(budget)).check_heaps().is_ok());
-        assert!(resources(72, Some(budget + 8)).check_heaps().is_err());
+        assert!(r.check_heaps(arena(budget)).is_ok());
+        assert!(r.check_heaps(arena(budget + 8)).is_err());
     }
 }

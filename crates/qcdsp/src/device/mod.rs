@@ -71,10 +71,9 @@ pub fn build(
     let resources = Resources {
         code_bytes: core1.content(Section::Code).map_or(0, <[u8]>::len),
         state_bytes: layout.bytes(),
-        arena_bytes: layout.arena.map(|arena| arena.bytes()),
         cycles_per_call: generated.cycles_per_call,
     };
-    resources.check_heaps()?;
+    resources.check_heaps(layout.arena)?;
     Ok(DeviceBlock {
         model_element: metadata::model_element(block, &blob_name, model_id, display_name)?,
         module_element: metadata::module_element(
