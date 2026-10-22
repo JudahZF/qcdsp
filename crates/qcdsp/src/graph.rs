@@ -461,7 +461,7 @@ impl Block {
         if !(1..=3).contains(&self.version) {
             return Err(Error::Invalid("unsupported IR version".into()));
         }
-        let reads_network = self.nodes.iter().any(|node| *node == Node::Network);
+        let reads_network = self.nodes.contains(&Node::Network);
         match &self.network {
             Some(network) => {
                 if self.version < 3 || self.channels != Channels::Mono {

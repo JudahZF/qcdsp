@@ -368,6 +368,9 @@ impl Evaluator {
     }
 }
 
+// Max then min, not `clamp`: the same order as the scalar `tanh` expansion and the device code,
+// including what a NaN does.
+#[allow(clippy::manual_clamp)]
 pub(crate) fn activate(function: Activation, x: f32) -> f32 {
     match function {
         Activation::Tanh => tanh(x),
@@ -377,6 +380,7 @@ pub(crate) fn activate(function: Activation, x: f32) -> f32 {
 }
 
 /// The scalar `tanh` expansion (`graph::Expander::tanh`), operation for operation.
+#[allow(clippy::manual_clamp)]
 pub(crate) fn tanh(x: f32) -> f32 {
     let x = x
         .max(-crate::graph::TANH_LIMIT)
@@ -441,7 +445,8 @@ impl NetworkBuilder {
         });
     }
 
-    /// A causal dilated convolution with weights ordered `[out][in][kernel]`; see [`Op::Conv`].
+    /// A causal dilated convolution with weights ordered `[out][in][kernel]`:
+    /// `output[o] (+)= bias[o] + Σ_i Σ_k weights[o][i][k] · input[i](t − (kernel − 1 − k)·dilation)`.
     #[allow(clippy::too_many_arguments)]
     pub fn conv(
         &mut self,

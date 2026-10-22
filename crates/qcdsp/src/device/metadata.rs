@@ -17,8 +17,10 @@ const CYCLES_PER_BLOCK: f64 = 450e6 * 32.0 / 48_000.0;
 /// blocks that overrun the core; an over-reported one only refuses a layout.
 const CPU_SAFETY: f64 = 2.0;
 /// The same for network frame kernels: their instruction counts are exact (counted loops, no
-/// branches), so the factor covers pipeline stalls only.
-const NETWORK_SAFETY: f64 = 2.0;
+/// branches), so the factor covers pipeline stalls only. Measured on a unit (2026-10-23, DSP
+/// Diagnostics, one block alone on a core): NAM trainer feather and lite took 1.22 times their
+/// instruction count; 1.4 leaves about 15 % of margin.
+const NETWORK_SAFETY: f64 = 1.4;
 /// The CPU budget of one core in ZenUI's core template (`_INIT_514` `0x155e1f8`). A block whose
 /// figure exceeds it can never be placed.
 pub const CORE_CPU: f64 = 96.0;

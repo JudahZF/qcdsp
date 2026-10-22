@@ -18,7 +18,7 @@ Per-core diff records are rebuilt by applying Volume's records to the stock blob
 
 ## Heap arena (state larger than 0x7fff bytes)
 
-Volume allocates the state with an `r4=imm16` (0x15b), so it holds at most 0x7fff bytes. When the per-channel banks (states, delay cursors, spills, delay buffers) do not fit, `Layout` moves them to an **arena** from kernel heap 0 (the DM heap, L1 block 0, 153,592 bytes; static RE note `dsp-heap-for-generated-blocks-20261022.md` §2). Parameters and control slots stay in the state, followed by one word: the arena pointer. Heap 0 is the larger L1 heap and Volume's own state comes from it; generated code never pairs a DM and a PM access, so heap 1 (PM) would gain nothing.
+Volume allocates the state with an `r4=imm16` (0x15b), so it holds at most 0x7fff bytes. When the per-channel banks (states, delay cursors, spills, delay buffers) do not fit, `Layout` moves them to an **arena** from kernel heap 0 (the DM heap, L1 block 0, 153,592 bytes; static RE note `dsp-heap-for-generated-blocks-20261022.md` §2). Parameters and control slots stay in the state, followed by one word: the arena pointer. Heap 0 is the larger L1 heap and Volume's own state comes from it; the scalar graph never pairs a DM and a PM access, so heap 1 (PM) would gain it nothing (networks keep their weights there, see below).
 
 | Callback | With an arena |
 | --- | --- |
@@ -33,6 +33,14 @@ The kernel call is the stock C call, copied from digital_delay `0x38c2..0x38c8` 
 The core 2–4 addresses of the two functions come from the user's own data: `KernelMap::add_stock_calls` on a stock blob that calls both (`template::KERNEL_CALL_SOURCE`, digital_delay) and its per-core records; `VolumeTemplate::with_kernel` takes the map. On the 4.1.x corpus this harvest gives all 188 calls of the research map, with no difference. The DM heap figure adds `(arena + 11) & !7`; a block whose figure exceeds heap 0 is refused.
 
 Generated process first runs the control steps once (parameter-only expressions, written to control slots after the parameter values), then for each channel a 32-sample loop of the sample steps. The sample steps load values at first use, write states as soon as their old value is dead, and spill to per-channel slots when registers run out. Layout: `crates/qcdsp/src/device/layout.rs`.
+
+## Networks (IR 3)
+
+A network block always has a DM arena (its bank, then the frame buffers of `device/frame.rs`) and a PM arena (heap 1) for its weights, its bias pairs and the tanh constants. The state ends with both pointers and two words per ring (the ring's base address and this call's first row). Init allocates both arenas, zeroes the DM arena, points every ring at its base and writes the weights with Type 16a `DM(I4,M6) = imm32` stores; destroy frees both; recovery zeroes the DM arena and resets the rings; process plays dry when either pointer is 0.
+
+Process runs the network before the sample loop (`device/kernels.rs`): it copies channel A into buffer 0, runs each kernel between `BIT SET MODE1` and `BIT CLR MODE1` (PEYEN, with BDCST1 for a convolution's input and BDCST9 for a fused condition), advances the ring cursors, and leaves I5 at the output buffer, which the sample loop reads through a `network` source. Every loop body is 48-bit instructions only, with no branch (PRM `.06.062`). The network phase saves and restores the preserved registers it uses (I5, I8-I11, M0-M3, M8-M11, and the B registers it sets, before I) and leaves every L register at zero.
+
+Verification: Tetrad's machine (now with Type 1a, multifunction computes, DAG2 PM data, SIMD with broadcast, circular buffers and the VISA loop-tail check) runs a two-array WaveNet and a network with the less common paths against the host reference, with the interrupt-stack, register, write-range and L checks of the other blocks. qc-asm checks each new form against PRM figures and stock words (its README). On a unit (CorOS 4.1.1, 2026-10-23): NAM trainer nano, feather and lite run; lite (75 % of a core, 129 KB DM arena, 25 KB weights) matched the host reference within 1e-5 after its history filled; the kernels took 1.22 times their instruction count.
 
 ## Callback contract (confirmed from stock code)
 

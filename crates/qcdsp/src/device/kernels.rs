@@ -410,7 +410,7 @@ fn row_pair(code: &mut VisaProgram, n: usize, taps: usize, terms: usize, residua
     let after_b = |j: usize| {
         if j == n - 1 {
             4
-        } else if (j + 1) % taps == 0 {
+        } else if (j + 1).is_multiple_of(taps) {
             3
         } else {
             1
