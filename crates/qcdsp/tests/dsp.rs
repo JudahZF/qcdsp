@@ -1,5 +1,5 @@
 use qcdsp::{
-    Block, BlockBuilder, Category, Error, Parameter, Processor,
+    Block, BlockBuilder, Category, Channels, Error, Parameter, Processor,
     codegen::{self, InputSource, Step},
     examples,
 };
@@ -90,6 +90,7 @@ fn lowering_matches_graph_execution_for_all_examples() {
         examples::envelope_filter().unwrap(),
         examples::micro_synth(examples::Voicing::Guitar).unwrap(),
         examples::micro_synth(examples::Voicing::Bass).unwrap(),
+        examples::saturator().unwrap(),
     ];
     for block in blocks {
         let decoded = Block::from_json(&block.to_json().unwrap()).unwrap();
@@ -428,4 +429,85 @@ fn render_chunk_boundaries_and_in_place_processing_agree() {
     }
     assert_eq!(all, chunked);
     assert!(processor.process(&[0.0], &mut []).is_err());
+}
+
+/// One block per IR 2 macro, `output = f(input)`, run through the host reference.
+fn unary(f: fn(&mut BlockBuilder, qcdsp::Signal) -> qcdsp::Result<qcdsp::Signal>) -> Processor {
+    let mut dsp = BlockBuilder::new("unary", "Unary", Category::Utility);
+    let input = dsp.input();
+    let output = f(&mut dsp, input).unwrap();
+    Processor::new(dsp.finish(output).unwrap()).unwrap()
+}
+
+#[test]
+fn ir2_approximations_stay_within_their_documented_error() {
+    let mut tanh = unary(BlockBuilder::tanh);
+    let mut sigmoid = unary(BlockBuilder::sigmoid);
+    let mut recip = unary(BlockBuilder::recip);
+    for step in -40_000..=40_000 {
+        let x = step as f32 * 2.5e-4;
+        let t = tanh.process_sample(x * 3.0);
+        assert!((t - (x * 3.0).tanh()).abs() <= 1e-4, "tanh({}) = {t}", x * 3.0);
+        let s = sigmoid.process_sample(x * 3.0);
+        let exact = 1.0 / (1.0 + (-x * 3.0).exp());
+        assert!((s - exact).abs() <= 5e-5, "sigmoid({}) = {s}", x * 3.0);
+    }
+    // Saturates and never leaves [-1, 1], even for huge inputs.
+    for x in [5.0_f32, 50.0, 1e30, -1e30] {
+        let t = tanh.process_sample(x);
+        assert!(t.abs() <= 1.0 && (t - x.signum()).abs() <= 1e-4, "tanh({x}) = {t}");
+    }
+    for exponent in -36..=36 {
+        for mantissa in [1.0_f32, 1.37, 2.9, 7.5] {
+            let x = mantissa * 10f32.powi(exponent);
+            for x in [x, -x] {
+                let r = recip.process_sample(x);
+                assert!((r * x - 1.0).abs() <= 4e-7, "recip({x}) = {r}");
+            }
+        }
+    }
+}
+
+#[test]
+fn ir_version_is_the_oldest_that_holds_the_block() {
+    assert_eq!(examples::gain().unwrap().version(), 1);
+    let saturator = examples::saturator().unwrap();
+    assert_eq!(saturator.version(), 2);
+    assert_eq!(saturator.channels(), Channels::Mono);
+    let json = saturator.to_json().unwrap();
+    let decoded = Block::from_json(&json).unwrap();
+    assert_eq!(decoded.channels(), Channels::Mono);
+    // An IR 1 reader of the same graph must not accept IR 2 features.
+    let downgraded = json.replace("\"version\": 2", "\"version\": 1");
+    assert!(matches!(Block::from_json(&downgraded), Err(Error::Invalid(_))));
+    let stereo = json.replace("\"channels\": \"mono\",", "");
+    let stereo_v1 = stereo.replace("\"version\": 2", "\"version\": 1");
+    assert!(matches!(Block::from_json(&stereo_v1), Err(Error::Invalid(_))));
+    assert!(Block::from_json(&json.replace("\"version\": 2", "\"version\": 3")).is_err());
+}
+
+#[test]
+fn saturator_matches_its_formula_and_hoists_parameter_math() {
+    let block = examples::saturator().unwrap();
+    let mut processor = Processor::new(block.clone()).unwrap();
+    processor.set_parameter(0, 12.0).unwrap();
+    processor.set_parameter(1, 0.2).unwrap();
+    processor.set_parameter(2, 0.8).unwrap();
+    for step in -100..=100 {
+        let x = step as f32 * 0.01;
+        let expected = 0.8 * ((12.0 * x + 0.2).tanh() - 0.2_f32.tanh()) / 12.0_f32.tanh();
+        let actual = processor.process_sample(x);
+        assert!((actual - expected).abs() <= 3e-4, "{x}: {actual} vs {expected}");
+    }
+    // tanh(bias), tanh(drive) and its reciprocal depend only on parameters.
+    let kernel = codegen::compile(&block).unwrap();
+    assert!(kernel.contract.control_slots >= 2);
+    let sample_computes = kernel
+        .contract
+        .sample
+        .iter()
+        .filter(|step| matches!(step, Step::Compute { .. }))
+        .count();
+    let all = kernel.contract.control.len() + kernel.contract.sample.len();
+    assert!(sample_computes * 2 < all, "{sample_computes} of {all} steps run per sample");
 }

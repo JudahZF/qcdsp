@@ -59,13 +59,21 @@ fn main() -> qcdsp::Result<()> {
 
 Operations: input, parameter, constant, state, delay tap, add, subtract, multiply, negate, absolute value, min and max.
 
-`qcdsp::examples` has these blocks: gain, biquad, feedback delay, soft clipper, sine tremolo, envelope filter, and models of the Electro-Harmonix Micro Synthesizer and Bass Micro Synthesizer (`examples::micro_synth`). `crates/qcdsp/src/examples/kit.rs` has the shared parts: one-pole filters, an envelope follower, a state-variable filter and a `2^x` approximation for exponential tapers.
+IR version 2 adds:
+
+- `div`, `recip`, `tanh` and `sigmoid`. They expand to the operations above before compilation (`Block::expanded`), so the host reference and the device compute the same thing. `recip` is a bit-pattern seed and three Newton steps: relative error about 2^-22 for normal `|x|` in about 1e-37..1e37. Outside that range the result can be infinite or NaN, which faults the block's DSP slot. `tanh` is a clamped Padé (7, 6) approximation within 1e-4 of tanh; `sigmoid(x)` is `0.5 + 0.5 tanh(x / 2)`.
+- `sub_bits`: integer subtraction of two bit patterns (the reciprocal seed).
+- `"channels": "mono"` (`BlockBuilder::mono`): the block computes channel A only and writes the result to both channels, at half the cost.
+
+`BlockBuilder::finish` writes the oldest version that holds the block, so a block without these features stays version 1.
+
+`qcdsp::examples` has these blocks: gain, biquad, a mono `tanh` saturator (IR 2), feedback delay, soft clipper, sine tremolo, envelope filter, and models of the Electro-Harmonix Micro Synthesizer and Bass Micro Synthesizer (`examples::micro_synth`). `crates/qcdsp/src/examples/kit.rs` has the shared parts: one-pole filters, an envelope follower, a state-variable filter and a `2^x` approximation for exponential tapers.
 
 Rules:
 
 - `state(initial)` is one persistent sample value. `delay(samples)` is a delay line that starts at zero. Each one has a maximum of one update. A read gives the value from the previous sample. An update takes effect at the next sample.
 - Parameters use DSP units. On the unit, each parameter shows as a 0..1 control. qcdsp maps it to `[min, max]`.
-- On the unit, a block processes 32-sample blocks of two channels. Each channel has its own state and its own `io` descriptor pointer. The two buffers do not have to be adjacent. The total state must be 32 KB or less. This gives delay lines of approximately 4000 samples per channel.
+- On the unit, a block processes 32-sample blocks of two channels (a mono block computes one and copies it). Each computed channel has its own state and its own `io` descriptor pointer. The two buffers do not have to be adjacent. The total state must be 32 KB or less. This gives delay lines of approximately 4000 samples per channel.
 - An expression of only parameters and constants (for example a taper or a filter coefficient) is calculated once per 32-sample call, not once per sample.
 - The compiler loads values when they are first used. It writes each state when its new value is available. When the 14 data registers (15 without delays) are all in use, the compiler reloads or spills values to a per-channel slot in the block state. Spills and hoisted values count toward the 32 KB.
 

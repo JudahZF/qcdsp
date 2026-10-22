@@ -106,6 +106,12 @@ pub enum Instruction {
         dst: Register,
         src: Register,
     },
+    /// Fixed-point ALU `Rn = Rx - Ry` on the 32-bit register bits.
+    IntegerSub {
+        dst: Register,
+        lhs: Register,
+        rhs: Register,
+    },
     /// Floating-point ALU PASS; unlike `Move`, affects arithmetic status/precision.
     FloatPass {
         dst: Register,
@@ -141,6 +147,7 @@ impl Instruction {
             Self::FloatNeg { dst, src } => compute(0, 0xa2, dst, src, 0),
             Self::FloatAbs { dst, src } => compute(0, 0xb0, dst, src, 0),
             Self::FloatPass { dst, src } => compute(0, 0xa1, dst, src, 0),
+            Self::IntegerSub { dst, lhs, rhs } => compute(0, 0x02, dst, lhs, rhs.index()),
             Self::LoadImmediate { dst, value } => {
                 (0x0f_u64 << 40) | (u64::from(dst.index()) << 32) | u64::from(value)
             }

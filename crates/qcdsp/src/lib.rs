@@ -8,7 +8,10 @@ pub mod examples;
 mod graph;
 mod host;
 
-pub use graph::{Block, BlockBuilder, Category, Delay, Parameter, Signal, State};
+pub use graph::{
+    Block, BlockBuilder, Category, Channels, Delay, MAX_NODES, MAX_PARAMETERS, MAX_STATES, Parameter,
+    Signal, State,
+};
 pub use host::Processor;
 
 #[derive(Debug, thiserror::Error)]

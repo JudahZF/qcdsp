@@ -25,6 +25,8 @@ Generated process first runs the control steps once (parameter-only expressions,
 - fault recovery (ctx[14], R4 = state): zero both channel banks, restore declared state initials and delay cursors, keep parameter values, and return through the kernel C frame. Live reset ctx[16] retains generated history and only resets the unused stock smoother.
 - C run-time model: R4/R8/R12 arguments, I6 frame, I7 stack, M5 = M13 = 0, M6 = M14 = 1, M7 = M15 = -1. L registers are zero except the kernel's circular stack L6/L7; generated code leaves lengths and bases unchanged. MODE1 has RND32, CBUFEN, IRPTEN and NESTM set, SIMD and broadcast clear; generated callbacks do not write it. Generated process saves every callee-preserved register it touches; init and set-parameter use only scratch registers.
 
+A mono block (IR 2) has one channel bank. After the sample loop of channel A, process reloads `io[0]` and `io[1]` and copies the 32 results to channel B with offset loads and stores. The reciprocal seed of IR 2 uses the fixed-point ALU subtract `Rn = Rx - Ry` (compute opcode 0x02); Tetrad's `tetrad-sharc` machine executes it in the generated-block tests.
+
 All generated memory accesses are unqualified normal-word accesses with word offsets or M modifiers, which the DAG scales for byte-addressed pointers, so the code does not depend on the numeric address space of `io[0]`.
 
 ## Verification without a device

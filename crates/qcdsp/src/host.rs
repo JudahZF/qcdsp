@@ -33,6 +33,7 @@ pub struct Processor {
 impl Processor {
     pub fn new(block: Block) -> Result<Self> {
         block.validate()?;
+        let block = block.expanded();
         Ok(Self {
             parameters: block
                 .parameters
@@ -127,9 +128,14 @@ impl Processor {
                     BinaryOp::Mul => self.values[lhs] * self.values[rhs],
                     BinaryOp::Min => self.values[lhs].min(self.values[rhs]),
                     BinaryOp::Max => self.values[lhs].max(self.values[rhs]),
+                    BinaryOp::SubBits => sub_bits(self.values[lhs], self.values[rhs]),
+                    BinaryOp::Div => unreachable!("Block::expanded replaces div"),
                 },
                 Node::Neg { input } => -self.values[input],
                 Node::Abs { input } => self.values[input].abs(),
+                Node::Recip { .. } | Node::Tanh { .. } | Node::Sigmoid { .. } => {
+                    unreachable!("Block::expanded replaces macro nodes")
+                }
             };
             self.values[index] = value;
         }
@@ -228,7 +234,12 @@ fn execute(registers: &mut [f32; 16], instruction: Instruction) {
         Instruction::FloatMax { dst, lhs, rhs } => (dst, get(lhs).max(get(rhs))),
         Instruction::FloatNeg { dst, src } => (dst, -get(src)),
         Instruction::FloatAbs { dst, src } => (dst, get(src).abs()),
+        Instruction::IntegerSub { dst, lhs, rhs } => (dst, sub_bits(get(lhs), get(rhs))),
         _ => unreachable!("DSP lowering emits only scalar register arithmetic"),
     };
     registers[dst.index() as usize] = value;
+}
+
+fn sub_bits(lhs: f32, rhs: f32) -> f32 {
+    f32::from_bits(lhs.to_bits().wrapping_sub(rhs.to_bits()))
 }
