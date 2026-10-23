@@ -472,14 +472,18 @@ impl VisaProgram {
         });
     }
 
-    /// Instructions, jumps included; labels are not instructions. A SHARC+ core issues one
-    /// instruction per cycle whatever its parcel width, so this (not the parcel count) is
-    /// the base of a cycle estimate.
+    /// Instructions, jumps included (`LeafReturn` is four); labels are not instructions.
+    /// A SHARC+ core issues one instruction per cycle whatever its parcel width, so this
+    /// (not the parcel count) is the base of a cycle estimate.
     pub fn instruction_count(&self) -> usize {
         self.items
             .iter()
-            .filter(|item| !matches!(item, Item::Label(_)))
-            .count()
+            .map(|item| match item {
+                Item::Label(_) => 0,
+                Item::Instruction(VisaInstruction::LeafReturn) => 4,
+                Item::Instruction(_) | Item::Jump { .. } => 1,
+            })
+            .sum()
     }
 
     /// Parcels emitted so far. Labels are not resolved (a jump is always three parcels), so

@@ -49,6 +49,20 @@ impl Category {
             Self::Synth => 30,
         }
     }
+
+    /// Categories that IR 1 readers do not know.
+    fn needs_ir2(self) -> bool {
+        matches!(
+            self,
+            Self::GuitarAmplifier
+                | Self::BassAmplifier
+                | Self::BassOverdrive
+                | Self::Compressor
+                | Self::Reverb
+                | Self::Wah
+                | Self::Synth
+        )
+    }
 }
 
 /// How many audio channels a block computes. A mono block runs once on channel A
@@ -232,6 +246,20 @@ impl Node {
                 | Self::Sigmoid { .. }
         )
     }
+
+    /// The number of primitive nodes that [`Block::expanded`] makes of this node.
+    fn expanded_len(&self) -> usize {
+        match self {
+            Self::Binary {
+                kind: BinaryOp::Div,
+                ..
+            } => RECIP_NODES + 1,
+            Self::Recip { .. } => RECIP_NODES,
+            Self::Tanh { .. } => TANH_NODES,
+            Self::Sigmoid { .. } => TANH_NODES + 4,
+            _ => 1,
+        }
+    }
 }
 
 /// `0x7ef311c7 - bits(x)` is within 12% of `1/x` for normal `x` of either sign
@@ -240,6 +268,9 @@ const RECIP_MAGIC: u32 = 0x7ef3_11c7;
 const RECIP_NEWTON_STEPS: usize = 3;
 /// Padé (7, 6) of tanh reaches 1 near here; outside it the output is clamped.
 const TANH_LIMIT: f32 = 4.97;
+/// Node counts of the expansions below; [`Block::expanded`] checks them in debug builds.
+const RECIP_NODES: usize = 3 + 3 * RECIP_NEWTON_STEPS;
+const TANH_NODES: usize = 36;
 
 /// Builds the primitive expansion of macro nodes into a new node list.
 struct Expander {
@@ -346,6 +377,7 @@ fn is_stereo(channels: &Channels) -> bool {
 
 /// Graph size limits. They bound host memory and compile time for untrusted IR;
 /// the device budget (code and state size, CPU) is checked when the block is built.
+/// `MAX_NODES` bounds the graph after macro expansion ([`Block::expanded`]).
 pub const MAX_NODES: usize = 65_536;
 pub const MAX_PARAMETERS: usize = 256;
 pub const MAX_STATES: usize = 4096;
@@ -375,7 +407,8 @@ impl Block {
     }
 
     /// The same graph under another identity. A host that installs blocks from many
-    /// sources gives each one a unique blob name and its own display name.
+    /// sources gives each one a unique blob name and its own display name. A category
+    /// that IR 1 does not know raises the version to 2.
     pub fn renamed(
         mut self,
         blob_name: impl Into<String>,
@@ -385,6 +418,9 @@ impl Block {
         self.blob_name = blob_name.into();
         self.name = name.into();
         self.category = category;
+        if self.needs_ir2() {
+            self.version = 2;
+        }
         self.validate()?;
         Ok(self)
     }
@@ -399,6 +435,7 @@ impl Block {
         let mut expander = Expander { nodes: Vec::new() };
         let mut map = Vec::with_capacity(self.nodes.len());
         for node in &self.nodes {
+            let start = expander.nodes.len();
             let new = match *node {
                 Node::Binary {
                     kind: BinaryOp::Div,
@@ -420,6 +457,7 @@ impl Block {
                 | Node::State { .. }
                 | Node::Delay { .. } => expander.push(node.clone()),
             };
+            debug_assert_eq!(expander.nodes.len() - start, node.expanded_len());
             map.push(new);
         }
         fn remap<T: Copy>(memories: &[Memory<T>], map: &[usize]) -> Vec<Memory<T>> {
@@ -455,21 +493,21 @@ impl Block {
         if !(1..=2).contains(&self.version) {
             return Err(Error::Invalid("unsupported IR version".into()));
         }
-        if self.version == 1
-            && (self.channels != Channels::Stereo || self.nodes.iter().any(Node::needs_ir2))
-        {
+        if self.version == 1 && self.needs_ir2() {
             return Err(Error::Invalid(
-                "mono blocks and sub_bits, div, recip, tanh and sigmoid need IR version 2".into(),
+                "mono blocks, sub_bits, div, recip, tanh, sigmoid and the amplifier, \
+                 bass overdrive, compressor, reverb, wah and synth categories need IR version 2"
+                    .into(),
             ));
         }
-        if self.nodes.len() > MAX_NODES
+        if self.nodes.iter().map(Node::expanded_len).sum::<usize>() > MAX_NODES
             || self.parameters.len() > MAX_PARAMETERS
             || self.states.len() > MAX_STATES
             || self.delays.len() > MAX_STATES
         {
             return Err(Error::Invalid(format!(
-                "block is too large (limits: {MAX_NODES} nodes, {MAX_PARAMETERS} parameters, \
-                 {MAX_STATES} states and {MAX_STATES} delays)"
+                "block is too large (limits: {MAX_NODES} nodes after expansion, \
+                 {MAX_PARAMETERS} parameters, {MAX_STATES} states and {MAX_STATES} delays)"
             )));
         }
         if qc_format::blob::validate_blob_name(&self.blob_name).is_err()
@@ -529,6 +567,12 @@ impl Block {
             }
         }
         Ok(())
+    }
+
+    fn needs_ir2(&self) -> bool {
+        self.channels != Channels::Stereo
+            || self.category.needs_ir2()
+            || self.nodes.iter().any(Node::needs_ir2)
     }
 
     pub(crate) fn roots(&self) -> Vec<usize> {
@@ -729,7 +773,7 @@ impl BlockBuilder {
     pub fn finish(mut self, output: Signal) -> Result<Block> {
         self.block.output = self.check(output)?;
         // Write the oldest IR version that holds the block, so older readers accept it.
-        if self.block.channels != Channels::Stereo || self.block.nodes.iter().any(Node::needs_ir2) {
+        if self.block.needs_ir2() {
             self.block.version = 2;
         }
         self.block.validate()?;
