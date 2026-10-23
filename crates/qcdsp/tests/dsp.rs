@@ -1,5 +1,5 @@
 use qcdsp::{
-    Block, BlockBuilder, Category, Channels, Error, Parameter, Processor,
+    Block, BlockBuilder, Category, Channels, Error, MAX_NODES, Parameter, Processor,
     codegen::{self, InputSource, Step},
     examples,
 };
@@ -497,6 +497,33 @@ fn ir_version_is_the_oldest_that_holds_the_block() {
         Err(Error::Invalid(_))
     ));
     assert!(Block::from_json(&json.replace("\"version\": 2", "\"version\": 4")).is_err());
+    // So must a category that IR 1 does not know.
+    let gain = examples::gain().unwrap();
+    let compressor = gain.clone().renamed("comp", "Comp", Category::Compressor);
+    assert_eq!(compressor.unwrap().version(), 2);
+    let json = gain.to_json().unwrap();
+    let compressor_v1 = json.replace("\"utility\"", "\"compressor\"");
+    assert!(matches!(
+        Block::from_json(&compressor_v1),
+        Err(Error::Invalid(_))
+    ));
+}
+
+#[test]
+fn node_limit_bounds_the_expanded_graph() {
+    // A sigmoid expands to 40 nodes; the input is one more.
+    let chain = |sigmoids: usize| {
+        let mut dsp = BlockBuilder::new("chain", "Chain", Category::Utility);
+        let mut signal = dsp.input();
+        for _ in 0..sigmoids {
+            signal = dsp.sigmoid(signal).unwrap();
+        }
+        dsp.finish(signal)
+    };
+    let largest = (MAX_NODES - 1) / 40;
+    let block = chain(largest).unwrap();
+    assert!(block.expanded().node_count() <= MAX_NODES);
+    assert!(matches!(chain(largest + 1), Err(Error::Invalid(_))));
 }
 
 #[test]

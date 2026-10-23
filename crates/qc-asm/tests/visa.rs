@@ -535,6 +535,7 @@ fn mixed_width_labels_use_branch_start_and_parcel_units() {
         0x4dfe, 0x0e3f, 0x083f, 0x343f, 0x1901, 0x0001,
     ];
     assert_eq!(program.parcels().unwrap(), expected);
+    assert_eq!(program.instruction_count(), 8);
     assert_eq!(
         program.encode().unwrap(),
         expected

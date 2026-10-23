@@ -25,11 +25,11 @@ Tetrad uses these crates as path dependencies:
 - **`qc-format`**: Tetrad's catalogue, block, DSP-host, media, CLI and app crates read and write ModuleBlobs, diff files and model metadata, and decrypt NDSP files.
 - **`qc-asm`**: Tetrad's `tetrad-blocks` and `tetrad-sharc` tests encode VISA instructions. These encodings are an independent check of Tetrad's own SHARC+ decoder.
 
-qcdsp does not depend on Tetrad. Tetrad's `tetrad-sharc` tests use the `qcdsp` crate and run the generated code of all eight examples on Tetrad's raw SHARC+ machine. That machine does not share code with `qc-asm`, so these tests do not check the encoder against itself.
+qcdsp does not depend on Tetrad. Tetrad's `tetrad-sharc` tests use the `qcdsp` crate and run the generated code of all nine examples on Tetrad's raw SHARC+ machine. That machine does not share code with `qc-asm`, so these tests do not check the encoder against itself.
 
 ## Status
 
-- All eight example blocks compile to installable stages. They run correctly on Tetrad's `tetrad-sharc` machine with PRM arithmetic.
+- All nine example blocks compile to installable stages. They run correctly on Tetrad's `tetrad-sharc` machine with PRM arithmetic.
 - The `Gain` example (model id 16901) loaded in a preset on a unit. It was then uninstalled to restore stock Cortex Control compatibility. Its audio output is not tested.
 - The other examples have not been installed on a unit with `qc-deploy`.
 - Tetrad deploys generated blocks without a file install. On 2026-10-22 six of them played on a unit and matched the host reference, including an arena echo and two NAM models (docs/abi-status.md).
@@ -65,6 +65,7 @@ IR version 2 adds:
 - `div`, `recip`, `tanh` and `sigmoid`. They expand to the operations above before compilation (`Block::expanded`), so the host reference and the device compute the same thing. `recip` is a bit-pattern seed and three Newton steps: relative error about 2^-22 for normal `|x|` in about 1e-37..1e37. Outside that range the result can be infinite or NaN, which faults the block's DSP slot. `tanh` is a Padé (7, 6) approximation of the clamped input, within 1e-4 of tanh and always inside (-1, 1); `sigmoid(x)` is `0.5 + 0.5 tanh(x / 2)`.
 - `sub_bits`: integer subtraction of two bit patterns (the reciprocal seed).
 - `"channels": "mono"` (`BlockBuilder::mono`): the block computes channel A only and writes the result to both channels, at half the cost.
+- The categories `guitar_amplifier`, `bass_amplifier`, `bass_overdrive`, `compressor`, `reverb`, `wah` and `synth`.
 
 IR version 3 adds a **network**: vector operations on channel buffers that run before the graph, for convolutional models such as NAM WaveNets (`NetworkBuilder`, `BlockBuilder::network`; `crates/qcdsp/src/network.rs`). Buffer 0 holds the block input; the graph reads the network's one-channel output with a `network` node. Operations: `gain` by a block parameter, `conv` (a causal dilated convolution; kernel 1 is a dense layer), `activation` (`tanh`, the same Padé approximation as the node; `hardtanh`; `relu`), `add` and `copy`. A buffer is written before it is read, and a buffer whose history a convolution reads does not change after that read. A network block is mono. `examples::wavenet` builds a NAM-style WaveNet.
 
