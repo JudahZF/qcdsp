@@ -4,6 +4,7 @@ use crate::{
     Block, Error, Result,
     codegen::{InputSource, Kernel, Step},
     graph::{BinaryOp, Node},
+    network::Evaluator,
 };
 
 struct DelayBuffer {
@@ -27,6 +28,7 @@ pub struct Processor {
     states: Vec<f32>,
     delays: Vec<DelayBuffer>,
     values: Vec<f32>,
+    network: Option<Evaluator>,
     lowered: Option<Lowered>,
 }
 
@@ -50,6 +52,7 @@ impl Processor {
                 })
                 .collect(),
             values: vec![0.0; block.nodes.len()],
+            network: block.network.as_ref().map(Evaluator::new),
             block,
             lowered: None,
         })
@@ -104,17 +107,25 @@ impl Processor {
             delay.cursor = 0;
         }
         self.values.fill(0.0);
+        if let Some(network) = &mut self.network {
+            network.reset();
+        }
     }
 
     pub fn process_sample(&mut self, input: f32) -> f32 {
+        let network = match (&mut self.network, &self.block.network) {
+            (Some(evaluator), Some(network)) => evaluator.run(network, &self.parameters, input),
+            _ => 0.0,
+        };
         if let Some(mut lowered) = self.lowered.take() {
-            let output = self.run_lowered(&mut lowered, input);
+            let output = self.run_lowered(&mut lowered, input, network);
             self.lowered = Some(lowered);
             return output;
         }
         for (index, node) in self.block.nodes.iter().enumerate() {
             let value = match *node {
                 Node::Input => input,
+                Node::Network => network,
                 Node::Constant { value } => value,
                 Node::Parameter { index } => self.parameters[index],
                 Node::State { index } => self.states[index],
@@ -156,7 +167,7 @@ impl Processor {
 
     /// The control phase runs every sample here; on the device it runs once per
     /// 32-sample call, which is equivalent while parameters are fixed.
-    fn run_lowered(&mut self, lowered: &mut Lowered, input: f32) -> f32 {
+    fn run_lowered(&mut self, lowered: &mut Lowered, input: f32, network: f32) -> f32 {
         let Lowered {
             kernel,
             registers,
@@ -170,6 +181,7 @@ impl Processor {
                 Step::Load { source, register } => {
                     registers[register as usize] = match source {
                         InputSource::Audio => input,
+                        InputSource::Network => network,
                         InputSource::Parameter { index } => self.parameters[index],
                         InputSource::State { index } => self.states[index],
                         InputSource::Delay { index } => {

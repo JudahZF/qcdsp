@@ -179,3 +179,76 @@ pub fn envelope_filter() -> Result<Block> {
     let output = kit::lerp(&mut dsp, input, wet, mix)?;
     dsp.finish(output)
 }
+
+/// One layer array of [`wavenet`]: input size, channels, head size, head bias, dilations.
+pub struct WavenetArray {
+    pub input: usize,
+    pub channels: usize,
+    pub head: usize,
+    pub head_bias: bool,
+    pub dilations: Vec<usize>,
+}
+
+/// A NAM-style WaveNet (kernel 3, tanh, ungated) as an IR 3 network, with deterministic
+/// pseudo-random weights in NAM's file order and an "Input" and "Output" gain. It shows the
+/// network operations and exercises the frame kernels; it is not a trained model.
+pub fn wavenet(arrays: &[WavenetArray]) -> Result<Block> {
+    use crate::{Activation, NetworkBuilder};
+    let mut seed = 0x2545_f491_4f6c_dd1d_u64;
+    let mut take = |n: usize| -> Vec<f32> {
+        (0..n)
+            .map(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                (seed >> 40) as f32 / (1u64 << 24) as f32 - 0.5
+            })
+            .collect()
+    };
+    let mut dsp = BlockBuilder::new("wavenet", "WaveNet", Category::GuitarAmplifier);
+    dsp.parameter(Parameter::new("Input", 0.0, 4.0, 1.0)?)?;
+    let output_gain = dsp.parameter(Parameter::new("Output", 0.0, 4.0, 1.0)?)?;
+    let mut net = NetworkBuilder::new();
+    let x = net.input();
+    net.gain(x, 0);
+    let mut input = x;
+    let mut head = None;
+    for array in arrays {
+        let c = array.channels;
+        let mut v = net.buffer(c);
+        net.conv(input, v, 1, 1, take(c * array.input), None, false);
+        let mut sum = head;
+        for &dilation in &array.dilations {
+            let z = net.buffer(c);
+            net.conv(v, z, 3, dilation, take(c * c * 3), Some(take(c)), false);
+            net.conv(x, z, 1, 1, take(c), None, true);
+            net.activation(z, Activation::Tanh);
+            sum = Some(match sum {
+                None => {
+                    let s = net.buffer(c);
+                    net.copy(z, s);
+                    s
+                }
+                Some(s) => {
+                    net.add(z, s);
+                    s
+                }
+            });
+            let next = net.buffer(c);
+            net.conv(z, next, 1, 1, take(c * c), Some(take(c)), false);
+            net.add(v, next);
+            v = next;
+        }
+        let out = net.buffer(array.head);
+        let weights = take(array.head * c);
+        let bias = array.head_bias.then(|| take(array.head));
+        let sum = sum.ok_or_else(|| crate::Error::Invalid("a layer array has no layers".into()))?;
+        net.conv(sum, out, 1, 1, weights, bias, false);
+        head = Some(out);
+        input = v;
+    }
+    let head = head.ok_or_else(|| crate::Error::Invalid("no layer arrays".into()))?;
+    let network = dsp.network(net.finish(head))?;
+    let out = dsp.mul(network, output_gain)?;
+    dsp.finish(out)
+}

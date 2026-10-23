@@ -7,12 +7,14 @@ pub mod device;
 pub mod examples;
 mod graph;
 mod host;
+pub mod network;
 
 pub use graph::{
     Block, BlockBuilder, Category, Channels, Delay, MAX_NODES, MAX_PARAMETERS, MAX_STATES,
     Parameter, Signal, State,
 };
 pub use host::Processor;
+pub use network::{Activation, Network, NetworkBuilder};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {

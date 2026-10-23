@@ -497,7 +497,7 @@ fn ir_version_is_the_oldest_that_holds_the_block() {
         Block::from_json(&stereo_v1),
         Err(Error::Invalid(_))
     ));
-    assert!(Block::from_json(&json.replace("\"version\": 2", "\"version\": 3")).is_err());
+    assert!(Block::from_json(&json.replace("\"version\": 2", "\"version\": 4")).is_err());
     // So must a category that IR 1 does not know.
     let gain = examples::gain().unwrap();
     let compressor = gain.clone().renamed("comp", "Comp", Category::Compressor);

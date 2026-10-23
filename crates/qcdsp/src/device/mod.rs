@@ -6,6 +6,8 @@
 //! records and the two catalogue entries; `qc-deploy` encrypts and installs them.
 
 mod emit;
+pub mod frame;
+mod kernels;
 mod layout;
 mod metadata;
 pub mod template;
@@ -72,8 +74,10 @@ pub fn build(
         code_bytes: core1.content(Section::Code).map_or(0, <[u8]>::len),
         state_bytes: layout.bytes(),
         cycles_per_call: generated.cycles_per_call,
+        network_cycles_per_call: generated.network_cycles_per_call,
     };
-    resources.check_heaps(layout.arena)?;
+    resources.check_heaps(layout.arena, layout.weights())?;
+    resources.check_cpu()?;
     Ok(DeviceBlock {
         model_element: metadata::model_element(block, &blob_name, model_id, display_name)?,
         module_element: metadata::module_element(

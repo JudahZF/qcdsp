@@ -14,17 +14,26 @@
 //! state: [0, 17+P+C) as above, then one word: the arena pointer (0 when the allocation failed)
 //! arena: bank(c) for each computed channel, from offset 0
 //! ```
+//! A block with a network (IR 3) always has a DM arena: its bank, then the network's frame
+//! buffers ([`super::frame`]). Its weights are in a second arena in the PM heap, and the state
+//! ends with the arena pointer, the weights pointer and two words per ring (its base address
+//! and the address of this call's first row):
+//! ```text
+//! state: [0, 17+P+C), arena pointer, weights pointer, (ring base, ring cursor) per ring
+//! arena: bank, frame buffers
+//! ```
 //! All offsets are normal-word units. Generated code only accesses state through
 //! unqualified normal-word loads/stores with these offsets, which the DAG scales
 //! for byte-addressed pointers, so no pointer arithmetic is done in data registers.
 
 use super::{
+    frame::FramePlan,
     metadata,
     template::{DM_HEAP_BYTES, MAX_STATE_BYTES, STOCK_STATE_BYTES},
 };
 use crate::{Block, Error, Result, codegen::Contract};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Layout {
     pub parameters: u32,
     pub controls: u32,
@@ -41,6 +50,29 @@ pub struct Layout {
     /// Words of Volume's state allocation.
     pub total_words: u32,
     pub arena: Option<Arena>,
+    /// The network's weights (PM heap) and frame buffers.
+    pub network: Option<NetworkLayout>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct NetworkLayout {
+    pub plan: FramePlan,
+    /// Word offset of the frame buffers in the arena, after the bank.
+    pub base: u32,
+    /// The weights arena (PM heap).
+    pub weights: Arena,
+    /// One per ring, in buffer order.
+    pub rings: Vec<Ring>,
+}
+
+/// State words of one ring buffer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Ring {
+    pub buffer: usize,
+    /// The ring's first word (an address).
+    pub base: u32,
+    /// The address of this call's first row.
+    pub cursor: u32,
 }
 
 /// Bank memory taken with `heap_malloc(heap, bytes)` when the banks do not fit the state.
@@ -58,8 +90,11 @@ pub struct Arena {
 pub enum Heap {
     /// Heap 0, L1 block 0: the heap Volume's own state comes from. An arena uses it while the
     /// block's DM figure fits the heap. Generated code never pairs a DM and a PM access, so
-    /// heap 1 (PM) would gain nothing.
+    /// heap 1 (PM) would gain nothing for the scalar graph.
     Dm = 0,
+    /// Heap 1, L1 block 2: network weights, so that one instruction reads a weight through the
+    /// PM bus and an activation from heap 0 through the DM bus.
+    Pm = 1,
     /// Heap 2, the core's 16 MiB of DDR (`0x80000000` on core 1): for arenas that do not fit
     /// heap 0. Plain DM loads and stores reach it, as stock GRU amps read their weights.
     Sd = 2,
@@ -73,6 +108,66 @@ impl Arena {
 
 impl Layout {
     pub fn new(block: &Block, contract: &Contract) -> Result<Self> {
+        let mut layout = Self::scalar(block, contract)?;
+        if let Some(network) = &block.network {
+            layout.add_network(FramePlan::new(network), network.output, contract)?;
+        }
+        Ok(layout)
+    }
+
+    /// A network block keeps its bank and the frame buffers in one DM arena, its weights in a
+    /// PM arena, and the ring addresses in the state.
+    fn add_network(&mut self, plan: FramePlan, output: usize, contract: &Contract) -> Result<()> {
+        if plan.rings.contains(&output) {
+            return Err(Error::Unsupported(
+                "a network output that a convolution reads with history".into(),
+            ));
+        }
+        let first = self.controls + contract.control_slots;
+        let banked = self.bank_words * self.banks.len() as u32;
+        let rings: Vec<Ring> = plan
+            .rings
+            .iter()
+            .enumerate()
+            .map(|(n, &buffer)| Ring {
+                buffer,
+                base: first + 2 + 2 * n as u32,
+                cursor: first + 3 + 2 * n as u32,
+            })
+            .collect();
+        self.total_words = first + 2 + 2 * rings.len() as u32;
+        if self.total_words * 4 > MAX_STATE_BYTES {
+            return Err(Error::Invalid("network: too many ring buffers".into()));
+        }
+        let arena = Arena {
+            pointer: first,
+            words: banked + plan.dm_words,
+            heap: Heap::Dm,
+        };
+        // History is read on every sample: the SD heap is far too slow for it.
+        if metadata::dm_heap(self.bytes(), Some(arena)) > DM_HEAP_BYTES {
+            return Err(Error::Invalid(format!(
+                "the network needs {} bytes of DM heap; heap 0 has {DM_HEAP_BYTES}",
+                arena.bytes()
+            )));
+        }
+        let weights = Arena {
+            pointer: first + 1,
+            words: plan.pm_words().max(2),
+            heap: Heap::Pm,
+        };
+        self.banks = vec![0];
+        self.arena = Some(arena);
+        self.network = Some(NetworkLayout {
+            base: banked,
+            plan,
+            weights,
+            rings,
+        });
+        Ok(())
+    }
+
+    fn scalar(block: &Block, contract: &Contract) -> Result<Self> {
         let too_large = || Error::Invalid("state too large".into());
         let parameters = STOCK_STATE_BYTES / 4;
         let controls = parameters + block.parameters.len() as u32;
@@ -124,7 +219,13 @@ impl Layout {
             delays,
             total_words,
             arena,
+            network: None,
         })
+    }
+
+    /// The weights arena of a network block.
+    pub fn weights(&self) -> Option<Arena> {
+        self.network.as_ref().map(|network| network.weights)
     }
 
     pub fn bytes(&self) -> u32 {

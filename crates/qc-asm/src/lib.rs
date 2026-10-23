@@ -1,7 +1,8 @@
 //! A restricted SHARC+ ISA48/VISA encoder derived from ADI's programming reference.
 //!
-//! This crate encodes scalar fragments and restricted leaf-callback sequences. It
-//! does not configure MODE1, allocate registers, schedule memory hazards, or establish an
+//! This crate encodes scalar fragments, restricted leaf-callback sequences, and the
+//! frame-kernel forms (dual moves, multifunction computes, counted loops, MODE1 bits).
+//! It does not track MODE1, allocate registers, schedule memory hazards, or establish an
 //! ABI. Float precision, rounding, exceptions, and SIMD execution depend on the
 //! caller's processor configuration. See the crate README for encoding evidence,
 //! serialization, address units, and unsupported operations.
@@ -13,8 +14,10 @@ use thiserror::Error;
 mod visa;
 
 pub use visa::{
-    Condition, IndexRegister, LEAF_RETURN_PARCELS, ModifyRegister, UniversalRegister, VisaError,
-    VisaInstruction, VisaProgram,
+    AluOp, Compute, Condition, DataAccess, Direction, FloatMulAlu, IndexRegister,
+    LEAF_RETURN_PARCELS, LoopCount, LoopMode, MODE1_BDCST1, MODE1_BDCST9, MODE1_PEYEN,
+    MemoryAccess, ModifyRegister, UniversalRegister, Update, VisaError, VisaInstruction,
+    VisaProgram,
 };
 
 /// The number of serialized bytes in one normal-word ISA instruction.
