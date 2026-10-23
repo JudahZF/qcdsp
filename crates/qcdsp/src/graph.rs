@@ -409,7 +409,7 @@ impl Block {
 
     /// The same graph under another identity. A host that installs blocks from many
     /// sources gives each one a unique blob name and its own display name. A category
-    /// that IR 1 does not know raises the version to 2.
+    /// that IR 1 does not know raises the version to at least 2.
     pub fn renamed(
         mut self,
         blob_name: impl Into<String>,
@@ -420,7 +420,7 @@ impl Block {
         self.name = name.into();
         self.category = category;
         if self.needs_ir2() {
-            self.version = 2;
+            self.version = self.version.max(2);
         }
         self.validate()?;
         Ok(self)
