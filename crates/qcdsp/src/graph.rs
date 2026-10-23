@@ -110,8 +110,9 @@ impl Parameter {
             || !self.min.is_finite()
             || !self.max.is_finite()
             || !self.default.is_finite()
-            || self.min > self.max
-            // The device maps 0..1 onto max - min, so the span must be finite too.
+            // The device maps 0..1 onto max - min: the span must be finite and not empty
+            // (an empty one normalises the default to 0 / 0).
+            || self.min >= self.max
             || !(self.max - self.min).is_finite()
             || !(self.min..=self.max).contains(&self.default)
         {
