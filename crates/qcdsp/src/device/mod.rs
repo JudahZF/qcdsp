@@ -1,8 +1,8 @@
 //! Installable Quad Cortex blocks.
 //!
 //! A [`Block`] is compiled into four VISA routines (init, process,
-//! set-parameter, fault recovery) that are appended to the stock Volume framework from the
-//! user's own firmware. The result is a core 1 ModuleBlob, the core 2-4 diff
+//! set-parameter, fault recovery), plus destroy when its banks need a heap arena, that are
+//! appended to the stock Volume framework from the user's own firmware. The result is a core 1 ModuleBlob, the core 2-4 diff
 //! records and the two catalogue entries; `qc-deploy` encrypts and installs them.
 
 mod emit;
@@ -16,8 +16,9 @@ use qc_format::{
 };
 
 pub use emit::Generated;
-pub use layout::Layout;
+pub use layout::{Arena, Heap, Layout};
 pub use metadata::{Resources, model_element, module_element};
+pub use qc_link::KernelMap;
 pub use template::{Entries, VolumeTemplate};
 
 use crate::{Block, Result, codegen};
@@ -66,17 +67,13 @@ pub fn build(
     );
     qc_format::blob::validate_blob_name(&blob_name)?;
     let (layout, generated) = generate(block)?;
-    let (core1, diffs) = template.link(
-        &blob_name,
-        &generated.parcels,
-        generated.entries,
-        layout.bytes(),
-    )?;
+    let (core1, diffs) = template.link(&blob_name, &generated, layout.bytes())?;
     let resources = Resources {
         code_bytes: core1.content(Section::Code).map_or(0, <[u8]>::len),
         state_bytes: layout.bytes(),
         cycles_per_call: generated.cycles_per_call,
     };
+    resources.check_heaps(layout.arena)?;
     Ok(DeviceBlock {
         model_element: metadata::model_element(block, &blob_name, model_id, display_name)?,
         module_element: metadata::module_element(

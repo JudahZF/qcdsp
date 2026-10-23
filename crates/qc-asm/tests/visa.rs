@@ -458,6 +458,27 @@ fn vectors() -> Vec<(VisaInstruction, Vec<u16>, &'static str)> {
             vec![0x073e, 0x0000, 0x0003],
             "JUMP(PC,0x3)",
         ),
+        // The stock C call to heap_malloc, digital_delay 0x38c4..0x38c8: CJUMP, push R2,
+        // push the return literal (before its kind-7 relocation).
+        (
+            VisaInstruction::CJump { target: 0x16_adfa },
+            vec![0x1804, 0x0016, 0xadfa],
+            "CJUMP 0x16ADFA (DB)",
+        ),
+        (
+            VisaInstruction::StoreDmPostModify {
+                src: r(2).into(),
+                index: i(7),
+                modifier: m(7),
+            },
+            vec![0x9ff2],
+            "DM(I7,M7)=R2",
+        ),
+        (
+            VisaInstruction::PushImmediate { value: 0xf8_38ca },
+            vec![0x9fc0, 0x00f8, 0x38ca],
+            "DM(I7,M7)=0xF838CA",
+        ),
     ]
 }
 
@@ -503,6 +524,8 @@ fn mixed_width_labels_use_branch_start_and_parcel_units() {
         src: r(0),
     }); // 3
     program.jump(Condition::Ne, "loop"); // parcel 8; target 0: -8
+    // "done" is still undefined: the count does not resolve labels.
+    assert_eq!(program.parcel_count().unwrap(), 11);
     program.label("done"); // parcel 11
     program.push(VisaInstruction::LeafReturn); // 6 parcels (not 4 instructions)
     let expected = [
@@ -602,6 +625,15 @@ fn register_offset_branch_and_label_validation() {
             Err(VisaError::BranchOutOfRange(i64::from(offset)))
         );
     }
+    assert!(
+        VisaInstruction::CJump { target: 0xff_ffff }
+            .encode()
+            .is_ok()
+    );
+    assert_eq!(
+        VisaInstruction::CJump { target: 0x100_0000 }.encode(),
+        Err(VisaError::CallTargetOutOfRange(0x100_0000))
+    );
     let mut missing = VisaProgram::new();
     missing.jump(Condition::Always, "missing");
     assert_eq!(

@@ -204,3 +204,48 @@ fn kernel_map_reproduces_stock_absolute_patches() {
     eprintln!("{sites} absolute kernel sites reproduced on cores 2-4");
     assert!(sites > 0);
 }
+
+/// The map harvested at run time from stock blobs and their per-core records (what a build
+/// uses without the research map) agrees with `kernel_call_map.json`, including the heap
+/// calls that generated arenas use.
+#[test]
+fn stock_calls_harvest_agrees_with_the_research_map() {
+    let Some(dir) = corpus() else {
+        return eprintln!("QC_CORPUS_DIR not set; skipped");
+    };
+    let Ok(text) = std::fs::read_to_string(dir.join("kernel_call_map.json")) else {
+        return eprintln!("no kernel_call_map.json; skipped");
+    };
+    let research = KernelMap::from_json(&text).unwrap();
+    let diff_files: Vec<DiffFile> = [2, 3, 4]
+        .iter()
+        .map(|core| {
+            let local = dir.join(format!("blobs/core{core}/diffs.blob"));
+            let path = if local.exists() {
+                local
+            } else {
+                dir.parent()
+                    .unwrap()
+                    .join(format!("rootfs/opt/neuraldsp/blobs/core{core}/diffs.blob"))
+            };
+            DiffFile::parse(&std::fs::read(path).unwrap()).unwrap()
+        })
+        .collect();
+    let mut harvested = KernelMap::default();
+    for (name, blob) in stock_blobs(&dir) {
+        let diffs = [0, 1, 2].map(|core| diff_files[core].get(&name).unwrap().clone());
+        harvested
+            .add_stock_calls(&blob, &diffs)
+            .unwrap_or_else(|e| panic!("{name}: {e}"));
+    }
+    for (core1, others) in harvested.iter() {
+        assert_eq!(research.get(core1), Some(others), "{core1:#x}");
+    }
+    eprintln!(
+        "{} harvested kernel calls match the research map",
+        harvested.len()
+    );
+    for heap in [0x16_adfa, 0x16_ad7e] {
+        assert!(harvested.get(heap).is_some(), "{heap:#x}");
+    }
+}

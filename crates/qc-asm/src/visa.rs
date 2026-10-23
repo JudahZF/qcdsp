@@ -122,6 +122,8 @@ pub enum VisaError {
     Dag1StoreSource(u8),
     #[error("PC-relative offset {0} is outside the signed 24-bit parcel range")]
     BranchOutOfRange(i64),
+    #[error("CJUMP target {0:#x} does not fit 24 bits")]
+    CallTargetOutOfRange(u32),
     #[error("duplicate VISA label {0:?}")]
     DuplicateLabel(String),
     #[error("undefined VISA label {0:?}")]
@@ -210,6 +212,16 @@ pub enum VisaInstruction {
         offset: i32,
         delayed: bool,
     },
+    /// Type 25a `CJUMP addr24 (DB)`: R2 = I6, I6 = I7, then an absolute jump whose two delay
+    /// slots must push R2 and the return literal (the stock C call, e.g. digital_delay
+    /// `0x38c4..0x38c8`). Not a hardware CALL: nothing is pushed on the PC stack.
+    CJump {
+        target: u32,
+    },
+    /// Type 16a `DM(I7,M7) = imm32`: pushes a literal (the C call's return address − 1).
+    PushImmediate {
+        value: u32,
+    },
     /// I12=DM(M7,I6); JUMP(M14,I12)(DB); RFRAME; NOP.
     /// Assumes the stock C-runtime frame and M7/M14 values; not an ABI validator.
     LeafReturn,
@@ -293,6 +305,15 @@ impl VisaInstruction {
                 offset,
                 delayed,
             } => jump_word(condition, i64::from(offset), delayed)?,
+            Self::CJump { target } => {
+                if target > 0xff_ffff {
+                    return Err(VisaError::CallTargetOutOfRange(target));
+                }
+                // Type 25a: 00011000, J (DB) at bit 34, ADDR24.
+                0x1804_0000_0000 | u64::from(target)
+            }
+            // Type 16a: 100, 1, I=7 (43:41), M=7 (40:38), G=0, DATA32.
+            Self::PushImmediate { value } => 0x9fc0_0000_0000 | u64::from(value),
             Self::LeafReturn => return Ok(LEAF_RETURN_PARCELS.to_vec()),
         };
         Ok(full_word_parcels(word))
@@ -461,6 +482,19 @@ impl VisaProgram {
                 Item::Label(_) => 0,
                 Item::Instruction(VisaInstruction::LeafReturn) => 4,
                 Item::Instruction(_) | Item::Jump { .. } => 1,
+            })
+            .sum()
+    }
+
+    /// Parcels emitted so far. Labels are not resolved (a jump is always three parcels), so
+    /// this works while a forward label is still undefined.
+    pub fn parcel_count(&self) -> Result<usize, VisaError> {
+        self.items
+            .iter()
+            .map(|item| match item {
+                Item::Instruction(instruction) => instruction.parcels().map(|p| p.len()),
+                Item::Label(_) => Ok(0),
+                Item::Jump { .. } => Ok(3),
             })
             .sum()
     }

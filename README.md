@@ -31,8 +31,9 @@ qcdsp does not depend on Tetrad. Tetrad's `tetrad-sharc` tests use the `qcdsp` c
 
 - All nine example blocks compile to installable stages. They run correctly on Tetrad's `tetrad-sharc` machine with PRM arithmetic.
 - The `Gain` example (model id 16901) loaded in a preset on a unit. It was then uninstalled to restore stock Cortex Control compatibility. Its audio output is not tested.
-- The other examples have not been installed on a unit.
-- CPU figures are estimates, not measurements: one cycle per instruction plus modelled DAG stalls, doubled in the catalogue entry.
+- The other examples have not been installed on a unit with `qc-deploy`.
+- Tetrad deploys generated blocks without a file install. On 2026-10-22 six of them played on a unit and matched the host reference, including an arena echo and two NAM models (docs/abi-status.md).
+- CPU figures are estimates, not measurements: one cycle per instruction plus modelled DAG stalls, doubled in the catalogue entry. On the unit, a NAM LSTM used about 1.4 times its modelled count.
 
 `docs/abi-status.md` lists the open items.
 
@@ -76,9 +77,9 @@ Rules:
 
 - `state(initial)` is one persistent sample value. `delay(samples)` is a delay line that starts at zero. Each one has a maximum of one update. A read gives the value from the previous sample. An update takes effect at the next sample.
 - Parameters use DSP units. On the unit, each parameter shows as a 0..1 control. qcdsp maps it to `[min, max]`.
-- On the unit, a block processes 32-sample blocks of two channels (a mono block computes one and copies it). Each computed channel has its own state and its own `io` descriptor pointer. The two buffers do not have to be adjacent. The total state must be 32 KB or less. This gives delay lines of approximately 4000 samples per channel.
+- On the unit, a block processes 32-sample blocks of two channels (a mono block computes one and copies it). Each computed channel has its own state and its own `io` descriptor pointer. The two buffers do not have to be adjacent. A state of 32 KB or less (delay lines up to approximately 4000 samples per channel) stays in the stock Volume allocation. A larger state goes into an arena that the block takes from a kernel heap at start: the DM heap (153,592 bytes) while the block's figure fits it (a stereo delay of approximately 19,000 samples per channel), else the SD heap (16 MiB of DDR per core). The catalogue reports the arena in `dm_heap` or `sd_heap`, and ZenUI refuses a layout that does not fit. That fit is the only guard: on a unit, a request larger than heap 0 was not refused by the kernel, and the core faulted. Each load or store in an SD arena costs about 40 cycles more than in L1 (measured), and the CPU figure includes it, so SD suits long delay lines with few taps. On a unit: a DM arena echo and a 512 KB SD arena delay matched the host, 100 redeploys left the heap unchanged, and SD arenas started on cores 2, 3 and 4.
 - An expression of only parameters and constants (for example a taper or a filter coefficient) is calculated once per 32-sample call, not once per sample.
-- The compiler loads values when they are first used. It writes each state when its new value is available. When the 14 data registers (15 without delays) are all in use, the compiler reloads or spills values to a per-channel slot in the block state. Spills and hoisted values count toward the 32 KB.
+- The compiler loads values when they are first used. It writes each state when its new value is available. When the 14 data registers (15 without delays) are all in use, the compiler reloads or spills values to a per-channel slot in the block state. Spills count toward the per-channel state. Hoisted values are always in the 32 KB allocation.
 
 ## Build and test
 
@@ -111,7 +112,7 @@ SELACHE=path/to/selache/bin \
 
 selache is GPL-3.0. qcdsp does not include or link it. The tests run it only as an external program.
 
-With these files, the tests do a round trip of all 371 stock blobs and diff files, link the stock blobs again, reproduce 40,889 kernel patch sites, stage, apply and restore a real stock payload on a private copy, link each example against the real Volume template, and run each generated block against the host reference.
+With these files, the tests do a round trip of all 371 stock blobs and diff files, link the stock blobs again, reproduce 40,889 kernel patch sites, check the kernel map that a build harvests from the stock records, stage, apply and restore a real stock payload on a private copy, link each example against the real Volume template, and run each generated block against the host reference.
 
 Without these files, `tests/dsp.rs` checks the register allocator on 300 random graphs at three register budgets against the graph interpreter. The host graph is a mathematical reference with a tolerance. It is not a bit-exact SHARC model.
 
