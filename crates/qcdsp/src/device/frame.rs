@@ -88,6 +88,11 @@ impl FramePlan {
                 };
                 let words = buffer.words();
                 let (first, last) = live[index];
+                // No operation touches it: it needs no storage (and must not move a slot's end).
+                if first == usize::MAX {
+                    buffer.offset = 0;
+                    return buffer;
+                }
                 let reuse = slots
                     .iter_mut()
                     .find(|(_, size, free)| history == 0 && *size == words && *free < first);
@@ -258,7 +263,9 @@ fn kernels(network: &Network, packed: &mut Vec<f32>) -> Vec<Kernel> {
                 bias: None,
                 accumulate: true,
                 ..
-            }) if o == output && c != output && network.buffers[*c] == 1 => {
+            // Not after an accumulating convolution: the host adds the old output before the
+            // condition, the fused kernel after it.
+            }) if o == output && c != output && network.buffers[*c] == 1 && !accumulate => {
                 next += 1;
                 Some((*c, w.as_slice()))
             }
@@ -369,5 +376,44 @@ mod tests {
             4.0, 0.0, 5.0, 0.0, 6.0, 0.0, 7.0, 0.0, 8.0, 0.0, 9.0, 0.0,
             0.0, 0.0,
         ][..]);
+    }
+
+    /// A buffer that no operation touches takes no storage and does not shorten the life of a
+    /// slot: here `x` (live to the add) and `y` must not share storage.
+    #[test]
+    fn unused_buffers_do_not_free_live_storage() {
+        let mut net = NetworkBuilder::new();
+        let x = net.input();
+        let _unused = net.buffer(1);
+        let (a, y) = (net.buffer(1), net.buffer(1));
+        net.copy(x, a);
+        net.conv(a, y, 1, 1, vec![2.0], None, false);
+        net.activation(y, crate::Activation::Relu);
+        net.add(x, y);
+        let plan = FramePlan::new(&net.finish(y));
+        assert_ne!(plan.buffers[0].offset, plan.buffers[3].offset);
+    }
+
+    /// A one-channel accumulate after an accumulating convolution is not fused: the host adds
+    /// the old output first, the fused kernel would add it last.
+    #[test]
+    fn a_condition_after_an_accumulating_convolution_runs_alone() {
+        let mut net = NetworkBuilder::new();
+        let x = net.input();
+        let y = net.buffer(1);
+        net.conv(x, y, 1, 1, vec![0.0], Some(vec![16_777_216.0]), false);
+        net.conv(x, y, 1, 1, vec![0.0], Some(vec![-16_777_216.0]), true);
+        net.conv(x, y, 1, 1, vec![1.0], None, true);
+        let plan = FramePlan::new(&net.finish(y));
+        let conditions: Vec<_> = plan
+            .kernels
+            .iter()
+            .map(|kernel| match kernel {
+                Kernel::Conv(conv) => conv.condition,
+                _ => panic!("only convolutions"),
+            })
+            .collect();
+        // The second has a bias and the third follows an accumulating one: three kernels.
+        assert_eq!(conditions, [None, None, None], "{:?}", plan.kernels);
     }
 }

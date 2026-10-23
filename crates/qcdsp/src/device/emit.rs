@@ -264,6 +264,18 @@ fn init(block: &Block, layout: &Layout, start: u32, links: &mut Links) -> Result
     match layout.arena {
         None => banks(&mut code, block, layout, 4),
         Some(arena) => {
+            if let Some(weights) = layout.weights() {
+                // Destroy frees a nonzero weights pointer: clear it before anything can fail.
+                code.push(V::LoadImmediate {
+                    dst: ureg_r(0),
+                    value: 0,
+                });
+                code.push(V::StoreDmOffset {
+                    src: ureg_r(0),
+                    index: i(SCRATCH_INDEX),
+                    offset: word(weights.pointer),
+                });
+            }
             code.push(V::LoadImmediate {
                 dst: ureg_r(8),
                 value: arena.bytes(),
