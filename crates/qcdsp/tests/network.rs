@@ -248,6 +248,12 @@ fn a_wavenet_network_matches_its_scalar_graph() {
     assert_eq!(network.version(), 3);
     let back = Block::from_json(&network.to_json().unwrap()).unwrap();
     assert_eq!(back, network, "IR 3 round-trips through JSON");
+    // A host renames installed blocks; a network block keeps IR 3.
+    let renamed = network
+        .clone()
+        .renamed("nam_lite", "Lite", Category::GuitarAmplifier)
+        .unwrap();
+    assert_eq!(renamed.version(), 3);
 
     let input = signal(4800);
     let mut expected = vec![0.0; input.len()];
