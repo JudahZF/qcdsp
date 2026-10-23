@@ -20,6 +20,26 @@ pub fn gain() -> Result<Block> {
 
 /// Direct-form II transposed biquad. Coefficients are [b0, b1, b2, a1, a2],
 /// already divided by a0. The caller is responsible for filter stability.
+/// A mono, IR 2 overdrive: `level * (tanh(drive x + bias) - tanh(bias)) / tanh(drive)`.
+/// The divisor and the bias offset depend only on parameters, so they run once per block.
+pub fn saturator() -> Result<Block> {
+    let mut dsp = BlockBuilder::new("saturator", "Saturator", Category::GuitarOverdrive);
+    dsp.mono();
+    let input = dsp.input();
+    let drive = dsp.parameter(Parameter::new("Drive", 1.0, 40.0, 8.0)?)?;
+    let bias = dsp.parameter(Parameter::new("Bias", 0.0, 0.5, 0.1)?)?;
+    let level = dsp.parameter(Parameter::new("Level", 0.0, 1.0, 0.5)?)?;
+    let driven = dsp.mul(input, drive)?;
+    let biased = dsp.add(driven, bias)?;
+    let shaped = dsp.tanh(biased)?;
+    let offset = dsp.tanh(bias)?;
+    let centred = dsp.sub(shaped, offset)?;
+    let ceiling = dsp.tanh(drive)?;
+    let normalized = dsp.div(centred, ceiling)?;
+    let output = dsp.mul(normalized, level)?;
+    dsp.finish(output)
+}
+
 pub fn biquad(coefficients: [f32; 5]) -> Result<Block> {
     let mut dsp = BlockBuilder::new("biquad", "Biquad EQ", Category::Equalizer);
     let input = dsp.input();

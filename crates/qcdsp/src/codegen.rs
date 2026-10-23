@@ -114,6 +114,7 @@ pub fn compile(block: &Block) -> Result<Kernel> {
 /// `available` (bit n = Rn). Device callbacks reserve loop and address registers.
 pub fn compile_with(block: &Block, available: u16) -> Result<Kernel> {
     block.validate()?;
+    let block = &block.expanded();
     let nodes = &block.nodes;
     let mut invariant = vec![false; nodes.len()];
     for (index, node) in nodes.iter().enumerate() {
@@ -609,6 +610,8 @@ fn lower(node: &Node, dst: u8, operands: &[u8]) -> Result<Instruction> {
                 BinaryOp::Mul => Instruction::FloatMul { dst, lhs, rhs },
                 BinaryOp::Min => Instruction::FloatMin { dst, lhs, rhs },
                 BinaryOp::Max => Instruction::FloatMax { dst, lhs, rhs },
+                BinaryOp::SubBits => Instruction::IntegerSub { dst, lhs, rhs },
+                BinaryOp::Div => unreachable!("Block::expanded replaces div"),
             }
         }
         Node::Neg { .. } => Instruction::FloatNeg {

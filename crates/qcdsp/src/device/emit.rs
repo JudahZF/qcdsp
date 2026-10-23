@@ -20,7 +20,7 @@ use qc_asm::{
 
 use super::{
     layout::Layout,
-    template::{BLOCK_SAMPLES, CHANNELS, Entries, STOCK_INIT, STOCK_PARCELS},
+    template::{BLOCK_SAMPLES, Entries, STOCK_INIT, STOCK_PARCELS},
 };
 use crate::{
     Block, Result,
@@ -132,7 +132,7 @@ fn initialize(block: &Block, layout: &Layout, start: u32, construction: bool) ->
             offset: word(layout.parameters + index as u32),
         });
     }
-    let bank_words = layout.banks[1] - layout.banks[0];
+    let bank_words = layout.bank_words;
     if bank_words > 0 {
         // Zero both banks with a post-increment walk, then write initial values.
         code.push(V::LoadImmediate {
@@ -141,7 +141,7 @@ fn initialize(block: &Block, layout: &Layout, start: u32, construction: bool) ->
         });
         code.push(V::LoadImmediate {
             dst: ureg_r(1),
-            value: bank_words * CHANNELS,
+            value: bank_words * layout.banks.len() as u32,
         });
         code.push(V::ModifyIndex {
             index: base,
@@ -162,7 +162,7 @@ fn initialize(block: &Block, layout: &Layout, start: u32, construction: bool) ->
             dst: ureg_i(SCRATCH_INDEX),
             src: ureg_r(4),
         });
-        for bank in layout.banks {
+        for &bank in &layout.banks {
             for (index, state) in block.states.iter().enumerate() {
                 code.push(V::LoadImmediate {
                     dst: ureg_r(0),
@@ -321,7 +321,7 @@ fn step(
     0
 }
 
-/// Returns the code and a cycle estimate for one call (both channels).
+/// Returns the code and a cycle estimate for one call (all channels).
 fn process(layout: &Layout, kernel: &Kernel) -> Result<(Vec<u16>, u64)> {
     let contract = &kernel.contract;
     let saved: Vec<UniversalRegister> = SAVED_DATA
@@ -365,11 +365,11 @@ fn process(layout: &Layout, kernel: &Kernel) -> Result<(Vec<u16>, u64)> {
     });
 
     // Hoisted parameter math, once per call for both channels.
-    let before = code.parcels()?.len();
+    let before = code.instruction_count();
     for &control in &contract.control {
         step(&mut code, kernel, layout, None, control);
     }
-    let control_parcels = (code.parcels()?.len() - before) as u64;
+    let control_instructions = (code.instruction_count() - before) as u64;
 
     let mut per_sample = 0;
     for (channel, &bank) in layout.banks.iter().enumerate() {
@@ -389,20 +389,54 @@ fn process(layout: &Layout, kernel: &Kernel) -> Result<(Vec<u16>, u64)> {
             value: BLOCK_SAMPLES,
         });
         code.label(&top);
-        let before = code.parcels()?.len();
+        let before = code.instruction_count();
         let mut delay_setups = 0;
         for &sample in &contract.sample {
             delay_setups += step(&mut code, kernel, layout, Some((channel, bank)), sample);
         }
-        // Parcels over-count instructions; add the SHARC+ DAG load-to-use stalls
-        // (4 cycles) for each delay pointer setup.
-        let parcels = (code.parcels()?.len() - before) as u64;
-        per_sample = per_sample.max(parcels + 4 * delay_setups + 2);
+        // One cycle per instruction, plus the SHARC+ DAG load-to-use stalls (4 cycles) of each
+        // delay pointer setup. The catalogue entry doubles the result (`metadata::CPU_SAFETY`)
+        // until a measurement on the unit replaces this model.
+        let instructions = (code.instruction_count() - before) as u64;
+        per_sample = per_sample.max(instructions + 4 * delay_setups + 2);
         code.push(V::IntegerSubOne {
             dst: r(COUNTER),
             src: r(COUNTER),
         });
         code.jump(Condition::Ne, &top);
+    }
+    let mut copy_cycles = 0;
+    if layout.banks.len() == 1 {
+        // Mono: channel B gets channel A's result. I1 moved during the loop; reload it.
+        code.push(V::LoadDmOffset {
+            dst: ureg_i(SCRATCH_INDEX),
+            index: i(6),
+            offset: descriptor_slot,
+        });
+        code.push(V::LoadDmOffset {
+            dst: ureg_i(AUDIO),
+            index: i(SCRATCH_INDEX),
+            offset: 0,
+        });
+        code.push(V::LoadDmOffset {
+            dst: ureg_i(DELAY),
+            index: i(SCRATCH_INDEX),
+            offset: 1,
+        });
+        for sample in 0..BLOCK_SAMPLES as i32 {
+            code.push(V::LoadDmOffset {
+                dst: ureg_r(0),
+                index: i(AUDIO),
+                offset: sample,
+            });
+            code.push(V::StoreDmOffset {
+                src: ureg_r(0),
+                index: i(DELAY),
+                offset: sample,
+            });
+        }
+        // Three pointer loads with DAG load-to-use stalls, then the copy.
+        copy_cycles = 3 * 5 + 2 * u64::from(BLOCK_SAMPLES);
     }
 
     for (slot, &register) in saved.iter().enumerate() {
@@ -413,9 +447,13 @@ fn process(layout: &Layout, kernel: &Kernel) -> Result<(Vec<u16>, u64)> {
         });
     }
     code.push(V::LeafReturn);
-    // Two channels of 32 samples, the per-sample body plus loop branch, the
-    // control phase, and a fixed allowance for frame setup, saves and restores.
-    let cycles = u64::from(CHANNELS * BLOCK_SAMPLES) * (per_sample + 8) + control_parcels + 120;
+    // Each computed channel's 32 samples, the per-sample body plus loop branch, the
+    // control phase, the mono copy, and a fixed allowance for frame setup, saves and restores.
+    let channels = layout.banks.len() as u64;
+    let cycles = channels * u64::from(BLOCK_SAMPLES) * (per_sample + 8)
+        + control_instructions
+        + copy_cycles
+        + 120;
     Ok((code.parcels()?, cycles))
 }
 

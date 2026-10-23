@@ -17,7 +17,7 @@ use qc_format::{
 
 pub use emit::Generated;
 pub use layout::Layout;
-pub use metadata::Resources;
+pub use metadata::{Resources, model_element, module_element};
 pub use template::{Entries, VolumeTemplate};
 
 use crate::{Block, Result, codegen};

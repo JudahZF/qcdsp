@@ -25,14 +25,14 @@ Tetrad uses these crates as path dependencies:
 - **`qc-format`**: Tetrad's catalogue, block, DSP-host, media, CLI and app crates read and write ModuleBlobs, diff files and model metadata, and decrypt NDSP files.
 - **`qc-asm`**: Tetrad's `tetrad-blocks` and `tetrad-sharc` tests encode VISA instructions. These encodings are an independent check of Tetrad's own SHARC+ decoder.
 
-qcdsp does not depend on Tetrad. Tetrad's `tetrad-sharc` tests use the `qcdsp` crate and run the generated code of all eight examples on Tetrad's raw SHARC+ machine. That machine does not share code with `qc-asm`, so these tests do not check the encoder against itself.
+qcdsp does not depend on Tetrad. Tetrad's `tetrad-sharc` tests use the `qcdsp` crate and run the generated code of all nine examples on Tetrad's raw SHARC+ machine. That machine does not share code with `qc-asm`, so these tests do not check the encoder against itself.
 
 ## Status
 
-- All eight example blocks compile to installable stages. They run correctly on Tetrad's `tetrad-sharc` machine with PRM arithmetic.
+- All nine example blocks compile to installable stages. They run correctly on Tetrad's `tetrad-sharc` machine with PRM arithmetic.
 - The `Gain` example (model id 16901) loaded in a preset on a unit. It was then uninstalled to restore stock Cortex Control compatibility. Its audio output is not tested.
 - The other examples have not been installed on a unit.
-- CPU figures are estimates, not measurements.
+- CPU figures are estimates, not measurements: one cycle per instruction plus modelled DAG stalls, doubled in the catalogue entry.
 
 `docs/abi-status.md` lists the open items.
 
@@ -59,13 +59,24 @@ fn main() -> qcdsp::Result<()> {
 
 Operations: input, parameter, constant, state, delay tap, add, subtract, multiply, negate, absolute value, min and max.
 
-`qcdsp::examples` has these blocks: gain, biquad, feedback delay, soft clipper, sine tremolo, envelope filter, and models of the Electro-Harmonix Micro Synthesizer and Bass Micro Synthesizer (`examples::micro_synth`). `crates/qcdsp/src/examples/kit.rs` has the shared parts: one-pole filters, an envelope follower, a state-variable filter and a `2^x` approximation for exponential tapers.
+IR version 2 adds:
+
+- `div`, `recip`, `tanh` and `sigmoid`. They expand to the operations above before compilation (`Block::expanded`), so the host reference and the device compute the same thing. `recip` is a bit-pattern seed and three Newton steps: relative error about 2^-22 for normal `|x|` in about 1e-37..1e37. Outside that range the result can be infinite or NaN, which faults the block's DSP slot. `tanh` is a Padé (7, 6) approximation of the clamped input, within 1e-4 of tanh and always inside (-1, 1); `sigmoid(x)` is `0.5 + 0.5 tanh(x / 2)`.
+- `sub_bits`: integer subtraction of two bit patterns (the reciprocal seed).
+- `"channels": "mono"` (`BlockBuilder::mono`): the block computes channel A only and writes the result to both channels, at half the cost.
+- The categories `guitar_amplifier`, `bass_amplifier`, `bass_overdrive`, `compressor`, `reverb`, `wah` and `synth`.
+
+`BlockBuilder::finish` writes the oldest version that holds the block, so a block without these features stays version 1.
+
+`cargo qcdsp export --example saturator --output saturator.qcdsp.json` writes an example's graph (or `--block <file>` re-validates one), for example for a Tetrad extension package.
+
+`qcdsp::examples` has these blocks: gain, biquad, a mono `tanh` saturator (IR 2), feedback delay, soft clipper, sine tremolo, envelope filter, and models of the Electro-Harmonix Micro Synthesizer and Bass Micro Synthesizer (`examples::micro_synth`). `crates/qcdsp/src/examples/kit.rs` has the shared parts: one-pole filters, an envelope follower, a state-variable filter and a `2^x` approximation for exponential tapers.
 
 Rules:
 
 - `state(initial)` is one persistent sample value. `delay(samples)` is a delay line that starts at zero. Each one has a maximum of one update. A read gives the value from the previous sample. An update takes effect at the next sample.
 - Parameters use DSP units. On the unit, each parameter shows as a 0..1 control. qcdsp maps it to `[min, max]`.
-- On the unit, a block processes 32-sample blocks of two channels. Each channel has its own state and its own `io` descriptor pointer. The two buffers do not have to be adjacent. The total state must be 32 KB or less. This gives delay lines of approximately 4000 samples per channel.
+- On the unit, a block processes 32-sample blocks of two channels (a mono block computes one and copies it). Each computed channel has its own state and its own `io` descriptor pointer. The two buffers do not have to be adjacent. The total state must be 32 KB or less. This gives delay lines of approximately 4000 samples per channel.
 - An expression of only parameters and constants (for example a taper or a filter coefficient) is calculated once per 32-sample call, not once per sample.
 - The compiler loads values when they are first used. It writes each state when its new value is available. When the 14 data registers (15 without delays) are all in use, the compiler reloads or spills values to a per-channel slot in the block state. Spills and hoisted values count toward the 32 KB.
 

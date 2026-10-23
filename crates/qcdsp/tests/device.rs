@@ -50,6 +50,7 @@ fn every_example_links_into_a_valid_blob_with_per_core_records() {
         examples::envelope_filter().unwrap(),
         examples::micro_synth(examples::Voicing::Guitar).unwrap(),
         examples::micro_synth(examples::Voicing::Bass).unwrap(),
+        examples::saturator().unwrap(),
     ];
     for (index, block) in blocks.iter().enumerate() {
         let built =
