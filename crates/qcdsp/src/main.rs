@@ -47,7 +47,7 @@ enum Command {
         /// Unused ModelRepo id for the new block.
         #[arg(long)]
         model_id: u32,
-        /// Display name; defaults to "<block name> (qcdsp)".
+        /// Display name; defaults to `"<block name> (qcdsp)"`.
         #[arg(long)]
         name: Option<String>,
         #[arg(short, long)]
@@ -407,7 +407,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     }
     match Cli::parse_from(arguments).command {
         Command::Export { source, output } => {
-            fs::write(&output, source.load()?.to_json()?)?;
+            write_new(&output, source.load()?.to_json()?.as_bytes())?;
             println!("wrote {}", output.display());
         }
         Command::Build {
