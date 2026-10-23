@@ -405,6 +405,7 @@ fn graph_handles_and_imported_ir_are_checked() {
     assert!(Parameter::new("", 0.0, 1.0, 0.5).is_err());
     // Finite bounds whose span overflows would map device values to infinity.
     assert!(Parameter::new("wide", -3e38, 3e38, 0.0).is_err());
+    assert!(Parameter::new("empty", 1.0, 1.0, 1.0).is_err());
     assert!(b.delay(0).is_err());
     let long = BlockBuilder::new("a".repeat(81), "Long", Category::Utility);
     let input = long.input();
