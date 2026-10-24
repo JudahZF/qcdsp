@@ -11,6 +11,9 @@
 //! bass version only changes the trigger and the filter sweep range; its
 //! envelope smoothing capacitors are about 2.2x larger, so its envelope is
 //! about 2.2x slower here, and its filter range sits one octave lower.
+//!
+//! The pedals are mono, so the block is mono (IR 2): it computes channel A and
+//! copies it to channel B, at half the cost of a stereo block.
 
 use super::kit::{self, SATURATE};
 use crate::{Block, BlockBuilder, Category, Parameter, Result};
@@ -71,6 +74,7 @@ const SYNTH_LEVEL: f32 = 0.3;
 pub fn micro_synth(voicing: Voicing) -> Result<Block> {
     let tuning = voicing.tuning();
     let mut dsp = BlockBuilder::new(tuning.blob_name, tuning.name, Category::Pitch);
+    dsp.mono();
     let input = kit::guarded_input(&mut dsp)?;
     // Controls in the pedal's left-to-right order. All are 0..1 like its sliders.
     let control = |dsp: &mut BlockBuilder, name: &str, default: f32| {

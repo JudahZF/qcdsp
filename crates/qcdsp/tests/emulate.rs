@@ -3,16 +3,17 @@
 //! The generated blob is disassembled by the independent research decoder
 //! (`QC_BLOBDIS`, a separate GPL tool run as a subprocess), and that text is
 //! executed here. Each example is called the way the kernel calls Volume's
-//! callbacks and must match the host reference on both channels, restore every
-//! callee-preserved register and the stack, and write only its own state and
-//! the audio buffer. Needs `QC_CORPUS_DIR` too. Arithmetic is host f32, not a
-//! model of SHARC rounding modes, so outputs are compared with a tolerance.
+//! callbacks and must match the host reference on both channels (a mono block
+//! copies channel A to channel B), restore every callee-preserved register and
+//! the stack, and write only its own state and the audio buffer. Needs
+//! `QC_CORPUS_DIR` too. Arithmetic is host f32, not a model of SHARC rounding
+//! modes, so outputs are compared with a tolerance.
 
 use std::{collections::HashMap, fs, path::PathBuf, process::Command};
 
 use qc_format::diff::DiffFile;
 use qcdsp::{
-    Block, BlockBuilder, Category, Parameter, Processor, codegen,
+    Block, BlockBuilder, Category, Channels, Parameter, Processor, codegen,
     device::{self, VolumeTemplate},
     examples,
 };
@@ -396,7 +397,12 @@ fn check(block: &Block, template: &VolumeTemplate, parameters: &[f32]) {
                 seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
                 let input = (seed >> 8) as f32 / (1 << 24) as f32 * 2.0 - 1.0;
                 machine.store(BUFFER + channel * 32 + sample, input.to_bits());
-                expected.push(hosts[channel as usize].process_sample(input));
+                let output = if channel == 1 && block.channels() == Channels::Mono {
+                    expected[sample as usize]
+                } else {
+                    hosts[channel as usize].process_sample(input)
+                };
+                expected.push(output);
             }
         }
         machine.writes.clear();
