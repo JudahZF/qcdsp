@@ -66,7 +66,7 @@ All generated memory accesses are unqualified normal-word accesses with word off
 
 ## Still open
 
-- Hardware execution: Gain (model id 16901) previously installed, passed ZenUI's integrity check and loaded in a preset (2026-10-06); it was uninstalled on 2026-10-16 to restore stock Cortex Control compatibility. On 2026-10-22 Tetrad deployed generated blocks through the stock BlobLoad path (no file install) on one CorOS 4.1.1 unit and compared USB audio with the host reference: Gain (8e-9), a tanh saturator (2e-6), slapback (5e-9), a 9000-sample arena echo (6e-9), a NAM LSTM (1.2e-6) and a small NAM WaveNet (7e-7). The biquad, tremolo, envelope filter and Micro Synth examples are not yet tested on the device.
+- Hardware execution: Gain (model id 16901) previously installed, passed ZenUI's integrity check and loaded in a preset (2026-10-06); it was uninstalled on 2026-10-16 to restore stock Cortex Control compatibility. On 2026-10-22 Tetrad deployed generated blocks through the stock BlobLoad path (no file install) on one CorOS 4.1.1 unit and compared USB audio with the host reference: Gain (8e-9), a tanh saturator (2e-6), slapback (5e-9), a 9000-sample arena echo (6e-9), a NAM LSTM (1.2e-6) and a small NAM WaveNet (7e-7). The biquad, tremolo, envelope filter and Sweep Synth examples are not yet tested on the device.
 - The DM heap figure follows the kernel allocator: `(bytes + 11) & ~7` per allocation (k1 `0x16adfa`), with Volume's state allocation replaced by the generated one, plus the arena.
 - Arena proofs on a unit (2026-10-22, through Tetrad, CorOS 4.1.1; proof IDs from the dsp-heap note):
   - P1 passed: a 9000-sample stereo echo (72 KB heap-0 arena) starts and matches the host within 6e-9.

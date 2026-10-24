@@ -48,8 +48,8 @@ fn every_example_links_into_a_valid_blob_with_per_core_records() {
         examples::biquad([0.06745527, 0.13491054, 0.06745527, -1.1429805, 0.4128016]).unwrap(),
         examples::tremolo().unwrap(),
         examples::envelope_filter().unwrap(),
-        examples::micro_synth(examples::Voicing::Guitar).unwrap(),
-        examples::micro_synth(examples::Voicing::Bass).unwrap(),
+        examples::sweep_synth(examples::Voicing::Guitar).unwrap(),
+        examples::sweep_synth(examples::Voicing::Bass).unwrap(),
         examples::saturator().unwrap(),
     ];
     for (index, block) in blocks.iter().enumerate() {

@@ -493,7 +493,7 @@ fn generated_callbacks_match_the_host_reference() {
     );
     for voicing in [examples::Voicing::Guitar, examples::Voicing::Bass] {
         check(
-            &examples::micro_synth(voicing).unwrap(),
+            &examples::sweep_synth(voicing).unwrap(),
             &template,
             &[0.1, 0.7, 0.3, 0.4, 0.6, 0.2, 0.8, 0.9, 0.1, 0.7],
         );

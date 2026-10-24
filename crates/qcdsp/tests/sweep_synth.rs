@@ -1,17 +1,17 @@
-//! Behaviour of the Micro Synth model, on the compiled kernel so the checks
+//! Behaviour of the Sweep Synth model, on the compiled kernel so the checks
 //! cover what the device runs (up to float modes).
 
 use std::f32::consts::TAU;
 
 use qcdsp::{
     Processor,
-    examples::{Voicing, micro_synth},
+    examples::{Voicing, sweep_synth},
 };
 
 const RATE: f32 = 48_000.0;
 
 fn synth(voicing: Voicing, settings: &[(&str, f32)]) -> Processor {
-    let block = micro_synth(voicing).unwrap();
+    let block = sweep_synth(voicing).unwrap();
     let names: Vec<String> = block
         .parameters()
         .iter()

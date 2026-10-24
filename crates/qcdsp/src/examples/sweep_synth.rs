@@ -1,4 +1,6 @@
-//! A model of the Electro-Harmonix Micro Synthesizer and Bass Micro Synthesizer.
+//! Sweep Synth: a mono comparator synth for guitar and bass. It models the
+//! Electro-Harmonix Micro Synthesizer and Bass Micro Synthesizer. These names are
+//! trademarks of their owner, and this project is not affiliated with it.
 //!
 //! Signal flow follows the pedals: four voices (sub octave, dry, octave up,
 //! square wave) are mixed into a resonant low-pass whose cutoff sweeps from
@@ -40,8 +42,8 @@ impl Voicing {
     fn tuning(self) -> Tuning {
         match self {
             Self::Guitar => Tuning {
-                blob_name: "micro_synth",
-                name: "Micro Synth",
+                blob_name: "sweep_synth",
+                name: "Sweep Synth",
                 dry: "GUITAR",
                 track_hz: 500.0,
                 filter_hz: 80.0,
@@ -49,8 +51,8 @@ impl Voicing {
                 release: 0.02,
             },
             Self::Bass => Tuning {
-                blob_name: "bass_micro_synth",
-                name: "Bass Micro Synth",
+                blob_name: "bass_sweep_synth",
+                name: "Bass Sweep Synth",
                 dry: "BASS",
                 track_hz: 250.0,
                 filter_hz: 40.0,
@@ -71,7 +73,7 @@ const HYSTERESIS: f32 = 0.1;
 const SUSTAIN: f32 = 3.0;
 const SYNTH_LEVEL: f32 = 0.3;
 
-pub fn micro_synth(voicing: Voicing) -> Result<Block> {
+pub fn sweep_synth(voicing: Voicing) -> Result<Block> {
     let tuning = voicing.tuning();
     let mut dsp = BlockBuilder::new(tuning.blob_name, tuning.name, Category::Pitch);
     dsp.mono();
