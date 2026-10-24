@@ -288,8 +288,8 @@ enum Example {
     SoftClip,
     Tremolo,
     EnvelopeFilter,
-    MicroSynth,
-    BassMicroSynth,
+    SweepSynth,
+    BassSweepSynth,
     Saturator,
 }
 
@@ -307,8 +307,8 @@ impl Source {
             Example::SoftClip => examples::soft_clip()?,
             Example::Tremolo => examples::tremolo()?,
             Example::EnvelopeFilter => examples::envelope_filter()?,
-            Example::MicroSynth => examples::micro_synth(examples::Voicing::Guitar)?,
-            Example::BassMicroSynth => examples::micro_synth(examples::Voicing::Bass)?,
+            Example::SweepSynth => examples::sweep_synth(examples::Voicing::Guitar)?,
+            Example::BassSweepSynth => examples::sweep_synth(examples::Voicing::Bass)?,
             Example::Saturator => examples::saturator()?,
         })
     }

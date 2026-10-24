@@ -75,7 +75,7 @@ On the unit a network runs once per 32-sample call, kernel by kernel over the wh
 
 `cargo qcdsp export --example saturator --output saturator.qcdsp.json` writes an example's graph (or `--block <file>` re-validates one), for example for a Tetrad extension package.
 
-`qcdsp::examples` has these blocks: gain, biquad, a mono `tanh` saturator (IR 2), feedback delay, soft clipper, sine tremolo, envelope filter, and models of the Electro-Harmonix Micro Synthesizer and Bass Micro Synthesizer (`examples::micro_synth`). `crates/qcdsp/src/examples/kit.rs` has the shared parts: one-pole filters, an envelope follower, a state-variable filter and a `2^x` approximation for exponential tapers.
+`qcdsp::examples` has these blocks: gain, biquad, a mono `tanh` saturator (IR 2), feedback delay, soft clipper, sine tremolo, envelope filter, and Sweep Synth, a mono comparator synth for guitar and bass with a filter that sweeps on each note (`examples::sweep_synth`, IR 2). `crates/qcdsp/src/examples/kit.rs` has the shared parts: one-pole filters, an envelope follower, a state-variable filter and a `2^x` approximation for exponential tapers.
 
 Rules:
 
@@ -184,7 +184,7 @@ Other commands: `render` (runs the host reference or the lowered interpreter on 
 Listen to a block before you install it:
 
 ```sh
-cargo qcdsp render --example micro-synth --input di.wav --output synth.wav --compiled \
+cargo qcdsp render --example sweep-synth --input di.wav --output synth.wav --compiled \
   --param "start freq=0.05" --param "stop freq=0.9" --param resonance=0.8
 ```
 

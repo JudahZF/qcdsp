@@ -2,11 +2,11 @@
 //! units; the rest are complete effects for the QC's 48 kHz sample rate.
 
 mod kit;
-mod micro_synth;
+mod sweep_synth;
 
 use std::f32::consts::TAU;
 
-pub use micro_synth::{Voicing, micro_synth};
+pub use sweep_synth::{Voicing, sweep_synth};
 
 use crate::{Block, BlockBuilder, Category, Parameter, Result};
 

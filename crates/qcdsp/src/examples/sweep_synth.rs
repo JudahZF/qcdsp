@@ -1,4 +1,6 @@
-//! A model of the Electro-Harmonix Micro Synthesizer and Bass Micro Synthesizer.
+//! Sweep Synth: a mono comparator synth for guitar and bass. It models the
+//! Electro-Harmonix Micro Synthesizer and Bass Micro Synthesizer. These names are
+//! trademarks of their owner, and this project is not affiliated with it.
 //!
 //! Signal flow follows the pedals: four voices (sub octave, dry, octave up,
 //! square wave) are mixed into a resonant low-pass whose cutoff sweeps from
@@ -11,6 +13,9 @@
 //! bass version only changes the trigger and the filter sweep range; its
 //! envelope smoothing capacitors are about 2.2x larger, so its envelope is
 //! about 2.2x slower here, and its filter range sits one octave lower.
+//!
+//! The pedals are mono, so the block is mono (IR 2): it computes channel A and
+//! copies it to channel B, at half the cost of a stereo block.
 
 use super::kit::{self, SATURATE};
 use crate::{Block, BlockBuilder, Category, Parameter, Result};
@@ -37,8 +42,8 @@ impl Voicing {
     fn tuning(self) -> Tuning {
         match self {
             Self::Guitar => Tuning {
-                blob_name: "micro_synth",
-                name: "Micro Synth",
+                blob_name: "sweep_synth",
+                name: "Sweep Synth",
                 dry: "GUITAR",
                 track_hz: 500.0,
                 filter_hz: 80.0,
@@ -46,8 +51,8 @@ impl Voicing {
                 release: 0.02,
             },
             Self::Bass => Tuning {
-                blob_name: "bass_micro_synth",
-                name: "Bass Micro Synth",
+                blob_name: "bass_sweep_synth",
+                name: "Bass Sweep Synth",
                 dry: "BASS",
                 track_hz: 250.0,
                 filter_hz: 40.0,
@@ -68,9 +73,10 @@ const HYSTERESIS: f32 = 0.1;
 const SUSTAIN: f32 = 3.0;
 const SYNTH_LEVEL: f32 = 0.3;
 
-pub fn micro_synth(voicing: Voicing) -> Result<Block> {
+pub fn sweep_synth(voicing: Voicing) -> Result<Block> {
     let tuning = voicing.tuning();
     let mut dsp = BlockBuilder::new(tuning.blob_name, tuning.name, Category::Pitch);
+    dsp.mono();
     let input = kit::guarded_input(&mut dsp)?;
     // Controls in the pedal's left-to-right order. All are 0..1 like its sliders.
     let control = |dsp: &mut BlockBuilder, name: &str, default: f32| {
