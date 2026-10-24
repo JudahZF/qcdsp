@@ -854,8 +854,13 @@ fn elementwise(
 
 /// Constants of an activation in both PEs (a Type 17 immediate load sets Rn and Sn in SIMD).
 fn constants(code: &mut VisaProgram, function: Activation) {
+    let slope;
     let values: &[(u8, u32)] = match function {
         Activation::Relu => &[(15, 0)],
+        Activation::LeakyRelu { negative_slope } => {
+            slope = [(15, negative_slope.to_bits())];
+            &slope
+        }
         Activation::Hardtanh => &[(14, (-1.0_f32).to_bits()), (15, 1.0_f32.to_bits())],
         Activation::Tanh => &[
             (6, (-crate::graph::TANH_LIMIT).to_bits()),
@@ -888,6 +893,19 @@ fn activation(code: &mut VisaProgram, function: Activation) {
             lhs: r(0),
             rhs: r(15),
         }],
+        // `max(x, s · x)`, as `crate::network::activate`.
+        Activation::LeakyRelu { .. } => vec![
+            FloatMul {
+                dst: r(1),
+                lhs: r(15),
+                rhs: r(0),
+            },
+            FloatMax {
+                dst: r(0),
+                lhs: r(0),
+                rhs: r(1),
+            },
+        ],
         Activation::Hardtanh => vec![
             FloatMax {
                 dst: r(0),
