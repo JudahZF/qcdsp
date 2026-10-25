@@ -312,6 +312,18 @@ fn invalid_networks_are_refused() {
         })
         .is_err()
     );
+    // A leaky ReLU slope outside 0 to 1, where `max(x, s · x)` is not a leaky ReLU.
+    for negative_slope in [-0.1, 1.5, f32::NAN] {
+        let mut dsp = BlockBuilder::new("bad", "Bad", Category::Utility);
+        let mut net = NetworkBuilder::new();
+        let a = net.buffer(1);
+        net.copy(net.input(), a);
+        net.activation(a, Activation::LeakyRelu { negative_slope });
+        assert!(
+            dsp.network(net.finish(a)).is_err(),
+            "slope {negative_slope}"
+        );
+    }
     // The wrong number of weights, and a gain by a missing parameter.
     assert!(
         build(|net| {
@@ -340,4 +352,33 @@ fn invalid_networks_are_refused() {
         })
         .is_ok()
     );
+}
+
+/// The IR form extensions write (`{ leakyRelu: s }` in the SDK), and what it computes.
+#[test]
+fn a_leaky_relu_scales_negative_values() {
+    let mut dsp = BlockBuilder::new("leaky", "Leaky", Category::Utility);
+    let mut net = NetworkBuilder::new();
+    let a = net.buffer(1);
+    net.copy(net.input(), a);
+    net.activation(
+        a,
+        Activation::LeakyRelu {
+            negative_slope: 0.01,
+        },
+    );
+    let out = dsp.network(net.finish(a)).unwrap();
+    let block = dsp.finish(out).unwrap();
+    let json = block.to_json().unwrap();
+    let compact: String = json.split_whitespace().collect();
+    assert!(
+        compact.contains(r#""function":{"leaky_relu":{"negative_slope":0.01}}"#),
+        "{json}"
+    );
+    assert_eq!(Block::from_json(&json).unwrap(), block);
+
+    let mut p = Processor::new(block).unwrap();
+    let mut output = [0.0; 3];
+    p.process(&[0.5, -2.0, 0.0], &mut output).unwrap();
+    assert_eq!(output, [0.5, -0.02, 0.0]);
 }

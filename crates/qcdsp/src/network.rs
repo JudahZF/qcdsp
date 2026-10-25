@@ -63,8 +63,8 @@ pub(crate) enum Op {
     Copy { input: usize, output: usize },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum Activation {
     /// The Padé (7, 6) approximation of the scalar `tanh` node (within 1e-4).
     Tanh,
@@ -72,6 +72,8 @@ pub enum Activation {
     Hardtanh,
     /// `max(x, 0)`.
     Relu,
+    /// `max(x, negative_slope · x)`: a leaky ReLU, exact for a slope from 0 to 1.
+    LeakyRelu { negative_slope: f32 },
 }
 
 impl Network {
@@ -174,7 +176,17 @@ impl Network {
                         frozen[*input] = true;
                     }
                 }
-                Op::Activation { buffer: b, .. } => {
+                Op::Activation {
+                    buffer: b,
+                    function,
+                } => {
+                    if let Activation::LeakyRelu { negative_slope } = function
+                        && !(0.0..=1.0).contains(negative_slope)
+                    {
+                        return invalid(format!(
+                            "operation {at}: a leaky ReLU slope is from 0 to 1"
+                        ));
+                    }
                     read(*b, &written)?;
                     write(*b, &mut written, &frozen)?;
                 }
@@ -376,6 +388,7 @@ pub(crate) fn activate(function: Activation, x: f32) -> f32 {
         Activation::Tanh => tanh(x),
         Activation::Hardtanh => x.max(-1.0).min(1.0),
         Activation::Relu => x.max(0.0),
+        Activation::LeakyRelu { negative_slope } => x.max(negative_slope * x),
     }
 }
 
